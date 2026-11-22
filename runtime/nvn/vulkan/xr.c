@@ -8,6 +8,7 @@
 // (a build without the OpenXR headers - macOS, Linux, Android, or Windows without the SDK: no VR)
 bool xr_on(void) { return false; }
 int xr_display_hz(void) { return 0; }
+int xr_eye_height(void) { return 0; }
 bool xr_setup(void) { return false; }
 VkResult xr_create_vk_instance(const VkInstanceCreateInfo *ci, VkInstance *out) { return vkCreateInstance(ci, NULL, out); }
 VkPhysicalDevice xr_vk_physical_device(VkInstance inst) { (void)inst; return VK_NULL_HANDLE; }
@@ -71,6 +72,7 @@ static struct {
     XrEnvironmentBlendMode blend;
     float vfov_deg;         // the eyes' vertical field of view (the widest), degrees: the game's while VR is on
     float ipd_m;            // between the eyes, metres (the runtime's views)
+    uint32_t rec_w, rec_h;  // the runtime's recommended eye image size
     // stereo (exec.c, each frame drawn for both eyes): the left and right game images, a swapchain each
     struct { XrSwapchain sc; int64_t fmt; uint32_t w, h, n; XrSwapchainImageVulkan2KHR *img; } eye[2];
     bool eyes_captured;
@@ -109,6 +111,7 @@ XR_FN(xrBeginFrame);
 XR_FN(xrEndFrame);
 XR_FN(xrLocateSpace);
 XR_FN(xrLocateViews);
+XR_FN(xrEnumerateViewConfigurationViews);
 XR_FN(xrGetVulkanGraphicsRequirements2KHR);
 XR_FN(xrCreateVulkanInstanceKHR);
 XR_FN(xrGetVulkanGraphicsDevice2KHR);
@@ -128,6 +131,14 @@ static const char *res(XrResult r) {
 
 bool xr_on(void) { return X.on; }
 int xr_display_hz(void) { return X.on && X.running && !X.throttled ? X.hz : 0; }
+// The game's render height while VR is on (device.c): the runtime's recommended eye image's, times the Video tab's
+// "VR resolution" - the eye's view is about the game image's height, so that's about a pixel per display pixel.
+// 0: not in VR (the window's size, as before).
+int xr_eye_height(void) {
+    if (!X.on || !X.rec_h) return 0;
+    int pct = g_settings.vr_res_pct >= VR_RES_MIN && g_settings.vr_res_pct <= VR_RES_MAX ? g_settings.vr_res_pct : 80;
+    return (int)(X.rec_h * pct / 100);
+}
 
 void xr_off(const char *why) {
     if (!X.inst) return;
@@ -181,7 +192,7 @@ bool xr_setup(void) {
               LOAD(X.inst, xrEnumerateSwapchainImages) && LOAD(X.inst, xrAcquireSwapchainImage) &&
               LOAD(X.inst, xrWaitSwapchainImage) && LOAD(X.inst, xrReleaseSwapchainImage) && LOAD(X.inst, xrWaitFrame) &&
               LOAD(X.inst, xrBeginFrame) && LOAD(X.inst, xrEndFrame) && LOAD(X.inst, xrLocateSpace) &&
-              LOAD(X.inst, xrLocateViews) &&
+              LOAD(X.inst, xrLocateViews) && LOAD(X.inst, xrEnumerateViewConfigurationViews) &&
               LOAD(X.inst, xrGetVulkanGraphicsRequirements2KHR) && LOAD(X.inst, xrCreateVulkanInstanceKHR) &&
               LOAD(X.inst, xrGetVulkanGraphicsDevice2KHR) && LOAD(X.inst, xrCreateVulkanDeviceKHR);
     if (!ok) { X.on = true; xr_off("the runtime lacks core functions"); return false; }
@@ -269,6 +280,15 @@ void xr_start_session(VkInstance inst, VkPhysicalDevice phys, VkDevice dev, uint
     p_xrEnumerateEnvironmentBlendModes(X.inst, X.sys, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 8, &n, bm);
     X.blend = n ? bm[0] : XR_ENVIRONMENT_BLEND_MODE_OPAQUE;  // (the runtime's preferred one first)
     if (!hmx) hmx = SDL_CreateMutex();  // (head tracking: before any game thread asks for a pose)
+    {   // the runtime's recommended size of an eye's image (xr_eye_height: the game's render size in VR)
+        XrViewConfigurationView vv[2] = {{.type = XR_TYPE_VIEW_CONFIGURATION_VIEW}, {.type = XR_TYPE_VIEW_CONFIGURATION_VIEW}};
+        uint32_t nv = 0;
+        if (XR_SUCCEEDED(p_xrEnumerateViewConfigurationViews(X.inst, X.sys, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 2,
+                                                              &nv, vv)) && nv >= 1) {
+            X.rec_w = vv[0].recommendedImageRectWidth, X.rec_h = vv[0].recommendedImageRectHeight;
+            LOG("[xr] recommended eye image %ux%u\n", X.rec_w, X.rec_h);
+        }
+    }
     LOG("[xr] session made; waiting for the headset\n");
 }
 
@@ -564,10 +584,16 @@ int xr_cam_sign(void) { return cam_sign ? cam_sign : 1; }
 // lately (in play: not menus, the morph ball, cutscenes - on the screen, one image does)
 bool xr_stereo_wanted(void) {
     if (!X.on || !X.running || X.throttled || !g_settings.vr_stereo || !hmx) return false;
+    uint64_t now = SDL_GetTicksNS();
     SDL_LockMutex(hmx);
-    bool head = last.cam && SDL_GetTicksNS() - last.ns < 150000000ull;
+    bool head = last.cam && now - last.ns < 150000000ull;
     SDL_UnlockMutex(hmx);
-    return head;
+    // (on once the head has been applied a third of a second running: in and out of play - a pause, the morph ball -
+    // turned it on and off a frame at a time, each time making the right eye's images anew)
+    static uint64_t since;
+    if (!head) since = 0;
+    else if (!since) since = now;
+    return head && now - since > 300000000ull;
 }
 float xr_vfov(void) { return X.on && X.running && X.vfov_deg > 0 ? X.vfov_deg : 0; }
 

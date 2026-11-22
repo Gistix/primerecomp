@@ -21,6 +21,8 @@ bool xr_on(void);
 // The headset's refresh rate rounded (Hz), once it is known (its first frame); 0 before, or without VR.
 // runtime/hle/game.c: the game's frame rate follows it when it is one the game runs at.
 int xr_display_hz(void);
+// The game's render height in VR (lines; the headset's recommended eye image's times "VR resolution"), 0 without VR
+int xr_eye_height(void);
 
 // ---- device.c, at start-up (each returns false / leaves VR off when the runtime can't)
 bool xr_setup(void);  // the loader, an instance with XR_KHR_vulkan_enable2, the headset (g_settings.vr)

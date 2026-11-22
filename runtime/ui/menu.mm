@@ -577,6 +577,10 @@ static void tab_display(void) {
     opt_slider("VR world scale", &g_settings.vr_world_scale, VR_SCALE_MIN, VR_SCALE_MAX, 0.05f, 1.0f, "%.2fx",
                "How big the world feels: how far apart your eyes are in it (and how far the view would move as you "
                "lean). Higher: the world feels smaller.");
+    opt_int("VR resolution", &g_settings.vr_res_pct, VR_RES_MIN, VR_RES_MAX, 5, 80, "%d%%",
+            "How sharp the game is drawn in the headset: a share of your headset's own resolution (100%: about a "
+            "pixel per pixel of its screens). Higher is sharper and needs more of your graphics card - each frame is "
+            "drawn for both eyes. Replaces Internal resolution while VR is on.");
     opt_toggle("VR stereo", &g_settings.vr_stereo, true,
                "In play each eye sees its own image, so the world has depth. Each frame is drawn twice, so it needs "
                "more of your computer. Off: one image for both eyes - flat, but lighter.");

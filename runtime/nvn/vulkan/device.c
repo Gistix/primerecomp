@@ -882,6 +882,11 @@ void backend_present(NvnTexture *t) {
         OutScale os;
         output_scale(dw, dh, t->width, t->height, widescreen_allowed(), SDL_GetTicksNS() / 1e9, -1, &os);
         double sx = os.sx, sy = os.sy, vx = os.vx, vy = os.vy, vw = os.vw, vh = os.vh, shape = os.shape;
+        {   // VR (xr.c): drawn at the headset's size, not the window's (Video tab "VR resolution"); the window
+            // shows it scaled to fit, as before
+            int eh = xr_eye_height();
+            if (eh > 0 && t->height > 0) sy = (double)eh / t->height, sx = sy * (shape > 0 ? shape : 1);
+        }
         float crop[4] = {0, 0, 1, 1};  // uv origin and size (the whole image)
         (void)shape;
         {   // a new window size, game image size or setting: the render size in the log

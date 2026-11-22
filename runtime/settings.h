@@ -57,6 +57,7 @@ enum { SUIT_COLOR_RED = 0, SUIT_COLOR_BLUE = 10, SUIT_COLOR_WHITE = 15 };
 #define VR_SCREEN_WIDTH_MAX 12.0f
 #define VR_SCALE_MIN 0.25f         // (VR: world scale, game units per metre: Video tab)
 #define VR_SCALE_MAX 4.0f
+enum { VR_RES_MIN = 40, VR_RES_MAX = 150 };  // (VR resolution, percent: Video tab)
 #define MOUSE_SENS_MIN 0.1f  // (mouse aim sensitivity range: Controls tab)
 #define MOUSE_SENS_MAX 10.0f
 // System language served to the game (runtime/services/am.c GetDesiredLanguage, services/hid_set.c GetLanguageCode):
@@ -103,6 +104,8 @@ typedef struct {
     float vr_world_scale;      // VR: game units per metre the head moves (1: the game's units as metres)
     bool vr_stereo;            // VR: in play each eye sees its own image - depth - drawn twice a frame (Vulkan
                                // exec.c); off: one image for both
+    int vr_res_pct;            // VR: the game's render height, percent of the headset's recommended eye image
+                               // (VR_RES_MIN..MAX; xr.c xr_eye_height) - in place of Internal resolution
     bool preload_shaders;  // the start screen builds every shader recorded so far before PLAY (runtime/nvn/vulkan/exec.c
                            // vk_preload_start): nothing seen before pops in when it's first drawn in a session
     bool texture_mods;   // the game's textures replaced by the files in mods/ (runtime/nvn/vulkan/texmods.c), from start
