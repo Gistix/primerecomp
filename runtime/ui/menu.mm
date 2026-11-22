@@ -581,6 +581,13 @@ static void tab_display(void) {
             "How sharp the game is drawn in the headset: a share of your headset's own resolution (100%: about a "
             "pixel per pixel of its screens). Higher is sharper and needs more of your graphics card - each frame is "
             "drawn for both eyes. Replaces Internal resolution while VR is on.");
+    opt_toggle("VR: move where you look", &g_settings.vr_move_head, true,
+               "Pushing the stick forward moves you where your head looks, as in most VR games; Samus keeps facing "
+               "and aiming where she did (the stick, gyro or mouse turn her). Off: forward is where Samus faces.");
+    opt_toggle("VR: aim with your hand", &g_settings.vr_hand_aim, true,
+               "With your headset's controllers: the arm cannon is in your right hand and fires where you point it. "
+               "The crosshair shows where. Locked on, it aims at the target, wherever you look. Off: it's where the game "
+               "puts it, aimed by the stick, gyro or mouse.");
     opt_toggle("VR stereo", &g_settings.vr_stereo, true,
                "In play each eye sees its own image, so the world has depth. Each frame is drawn twice, so it needs "
                "more of your computer. Off: one image for both eyes - flat, but lighter.");

@@ -104,6 +104,8 @@ typedef struct {
     float vr_world_scale;      // VR: game units per metre the head moves (1: the game's units as metres)
     bool vr_stereo;            // VR: in play each eye sees its own image - depth - drawn twice a frame (Vulkan
                                // exec.c); off: one image for both
+    bool vr_move_head;         // VR: the move stick goes where the head looks, not where Samus faces (input.c)
+    bool vr_hand_aim;          // VR: the arm cannon in the right controller's hand, aimed by it (game.c vr_hand_gun)
     int vr_res_pct;            // VR: the game's render height, percent of the headset's recommended eye image
                                // (VR_RES_MIN..MAX; xr.c xr_eye_height) - in place of Internal resolution
     bool preload_shaders;  // the start screen builds every shader recorded so far before PLAY (runtime/nvn/vulkan/exec.c

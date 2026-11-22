@@ -10,6 +10,9 @@ bool xr_on(void) { return false; }
 int xr_display_hz(void) { return 0; }
 int xr_eye_height(void) { return 0; }
 float xr_shape(void) { return 0; }
+bool xr_head_yaw(float *yaw) { *yaw = 0; return false; }
+bool xr_hand(float rot[9], float pos[3]) { (void)rot, (void)pos; return false; }
+int xr_recenter_count(void) { return 0; }
 bool xr_setup(void) { return false; }
 VkResult xr_create_vk_instance(const VkInstanceCreateInfo *ci, VkInstance *out) { return vkCreateInstance(ci, NULL, out); }
 VkPhysicalDevice xr_vk_physical_device(VkInstance inst) { (void)inst; return VK_NULL_HANDLE; }
@@ -87,6 +90,7 @@ static struct {
     XrSwapchainImageVulkan2KHR *sc_img;
 } X;
 static SDL_Mutex *hmx;  // (head poses: the game's update thread writes them, the render thread matches its frames)
+static bool g_xr_pico;  // (the runtime knows Pico's controllers: XR_BD_controller_interaction - setup_actions)
 
 #define XR_FN(name) static PFN_##name p_##name
 XR_FN(xrEnumerateInstanceExtensionProperties);
@@ -186,12 +190,18 @@ bool xr_setup(void) {
     for (uint32_t i = 0; i < n; i++) ep[i].type = XR_TYPE_EXTENSION_PROPERTIES;
     p_xrEnumerateInstanceExtensionProperties(NULL, n, &n, ep);
     bool vk2 = false;
-    for (uint32_t i = 0; i < n; i++) vk2 |= !strcmp(ep[i].extensionName, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME);
+    for (uint32_t i = 0; i < n; i++) {
+        vk2 |= !strcmp(ep[i].extensionName, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME);
+        // (Pico's runtime names its controllers' own profile - bytedance/pico4_controller - through this one; through
+        // Virtual Desktop a Pico is a Quest 2 with Touch controllers: setup_actions suggests both)
+        g_xr_pico |= !strcmp(ep[i].extensionName, XR_BD_CONTROLLER_INTERACTION_EXTENSION_NAME);
+    }
     free(ep);
     if (!vk2) { LOG("[xr] the OpenXR runtime has no %s: VR off\n", XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME); return false; }
 
-    const char *ext[] = {XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME};
-    XrInstanceCreateInfo ci = {.type = XR_TYPE_INSTANCE_CREATE_INFO, .enabledExtensionCount = 1, .enabledExtensionNames = ext};
+    const char *ext[] = {XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME, XR_BD_CONTROLLER_INTERACTION_EXTENSION_NAME};
+    XrInstanceCreateInfo ci = {.type = XR_TYPE_INSTANCE_CREATE_INFO, .enabledExtensionCount = g_xr_pico ? 2 : 1,
+                               .enabledExtensionNames = ext};
     snprintf(ci.applicationInfo.applicationName, sizeof ci.applicationInfo.applicationName, "PrimeRecomp");
     snprintf(ci.applicationInfo.engineName, sizeof ci.applicationInfo.engineName, "PrimeRecomp");
     ci.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);  // (1.0: what every runtime still takes)
@@ -368,13 +378,22 @@ static void setup_actions(void) {
         sb[i].action = b[i].a;
         p_xrStringToPath(X.inst, b[i].path, &sb[i].binding);
     }
-    XrPath touch;
-    p_xrStringToPath(X.inst, "/interaction_profiles/oculus/touch_controller", &touch);
-    XrInteractionProfileSuggestedBinding pb = {.type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING,
-                                               .interactionProfile = touch, .countSuggestedBindings = NB,
-                                               .suggestedBindings = sb};
-    XrResult r = p_xrSuggestInteractionProfileBindings(X.inst, &pb);
-    if (XR_FAILED(r)) { LOG("[xr] Touch controller bindings: %s\n", res(r)); return; }
+    // the same paths on Quest Touch controllers (and what Virtual Desktop makes of others: a Pico's) and Pico 4's own
+    static const char *const profiles[] = {"/interaction_profiles/oculus/touch_controller",
+                                           "/interaction_profiles/bytedance/pico4_controller"};
+    XrResult r = XR_SUCCESS;
+    int nok = 0;
+    for (int p = 0; p < (g_xr_pico ? 2 : 1); p++) {
+        XrPath prof;
+        p_xrStringToPath(X.inst, profiles[p], &prof);
+        XrInteractionProfileSuggestedBinding pb = {.type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING,
+                                                   .interactionProfile = prof, .countSuggestedBindings = NB,
+                                                   .suggestedBindings = sb};
+        r = p_xrSuggestInteractionProfileBindings(X.inst, &pb);
+        if (XR_FAILED(r)) LOG("[xr] %s bindings: %s\n", profiles[p], res(r));
+        else nok++;
+    }
+    if (!nok) return;
     XrSessionActionSetsAttachInfo at = {.type = XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO, .countActionSets = 1,
                                         .actionSets = &A.set};
     r = p_xrAttachSessionActionSets(X.session, &at);
@@ -385,7 +404,7 @@ static void setup_actions(void) {
         p_xrCreateActionSpace(X.session, &ci, &A.aim_space[h]);
     }
     A.ok = true;
-    LOG("[xr] controllers: Touch bindings suggested\n");
+    LOG("[xr] controllers: Touch%s bindings suggested\n", g_xr_pico ? " and Pico 4" : "");
 }
 
 static bool act_bool(XrAction a, XrPath sub, bool *active) {
@@ -738,6 +757,53 @@ static XrVector3f qrot(XrQuaternionf q, XrVector3f v) {
 }
 void xr_recenter(void) { recenter_req = true; }
 int xr_cam_sign(void) { return cam_sign ? cam_sign : 1; }
+static _Atomic int recenter_count;  // (recenters so far: game.c takes the hand's resting place again after one)
+int xr_recenter_count(void) { return recenter_count; }
+static bool have_ref;
+static XrPosef ref;  // straight ahead and the head's place (Recenter): its yaw only, so up stays up
+
+// A rotation relative to straight ahead in the first-person camera's own axes (xr_head's: column j = where the
+// camera's axis j turns to)
+static void rel_rotation(XrQuaternionf q, float rot[9]) {
+    float sg = (float)(cam_sign ? cam_sign : 1);
+    for (int j = 0; j < 3; j++) {
+        XrVector3f e = {j == 0 ? sg : 0, j == 1, j == 2 ? sg : 0}, c = qrot(q, e);
+        rot[0 * 3 + j] = sg * c.x, rot[1 * 3 + j] = c.y, rot[2 * 3 + j] = sg * c.z;
+    }
+}
+
+// The right controller's aim (runtime/hle/game.c: the arm cannon), relative to straight ahead and the head's place at
+// the last recenter, as xr_head's: its rotation in the camera's axes, its place in OpenXR's (x right, y up, z back),
+// game units. false: no controller tracked (then the game's own aim).
+bool xr_hand(float rot[9], float pos[3]) {
+    if (!X.on || !X.running || X.throttled || !A.ok || !A.aim_space[1] || !have_ref || !X.display_time ||
+        X.state != XR_SESSION_STATE_FOCUSED || !g_settings.vr_hand_aim)
+        return false;
+    XrSpaceLocation loc = {.type = XR_TYPE_SPACE_LOCATION};
+    if (XR_FAILED(p_xrLocateSpace(A.aim_space[1], X.space, X.display_time + X.period, &loc))) return false;
+    const XrSpaceLocationFlags need = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
+    if ((loc.locationFlags & need) != need) return false;
+    XrQuaternionf iq = qconj(ref.orientation);
+    rel_rotation(qmul(iq, loc.pose.orientation), rot);
+    XrVector3f d = {loc.pose.position.x - ref.position.x, loc.pose.position.y - ref.position.y,
+                    loc.pose.position.z - ref.position.z};
+    XrVector3f dp = qrot(iq, d);
+    float s = g_settings.vr_world_scale > 0.1f ? g_settings.vr_world_scale : 1.0f;
+    pos[0] = dp.x * s, pos[1] = dp.y * s, pos[2] = dp.z * s;
+    return true;
+}
+
+// The head's turn from Samus' facing about up (radians, left positive), while the head is applied in play
+// (runtime/hle/input.c: the move stick follows where the player looks)
+static _Atomic float g_head_yaw;
+bool xr_head_yaw(float *yaw) {
+    if (!hmx) return false;
+    SDL_LockMutex(hmx);
+    bool on = last.cam && SDL_GetTicksNS() - last.ns < 150000000ull;
+    SDL_UnlockMutex(hmx);
+    *yaw = g_head_yaw;
+    return on;
+}
 // Draw the next frame for both eyes (exec.c vk_set_stereo): VR on, the Video tab's "VR stereo", and the head applied
 // lately (in play: not menus, the morph ball, cutscenes - on the screen, one image does)
 // In play for a while: the head applied for a third of a second running (in and out of play - a pause, the morph
@@ -775,8 +841,6 @@ bool xr_head(float rot[9], float pos[3], uint32_t *id) {
     if (XR_FAILED(p_xrLocateSpace(X.view, X.space, X.display_time + X.period, &loc))) return false;
     if (!(loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) return false;
     if (!(loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)) loc.pose.position = (XrVector3f){0, 0, 0};
-    static bool have_ref;
-    static XrPosef ref;  // straight ahead and the head's place (Recenter): its yaw only, so up stays up
     if (recenter_req || !have_ref) {
         recenter_req = false, have_ref = true;
         XrVector3f f = qrot(loc.pose.orientation, (XrVector3f){0, 0, -1});
@@ -784,8 +848,13 @@ bool xr_head(float rot[9], float pos[3], uint32_t *id) {
         ref.orientation = (XrQuaternionf){0, sinf(yaw / 2), 0, cosf(yaw / 2)};
         ref.position = loc.pose.position;
         LOG("[xr] recentered: ahead is %.0f degrees from the room's\n", yaw * 57.29578f);
+        recenter_count++;
     }
     XrQuaternionf iq = qconj(ref.orientation), q = qmul(iq, loc.pose.orientation);
+    {   // (how far the head is turned from straight ahead - Samus' facing - about up: xr_head_yaw, the move stick's)
+        XrVector3f f = qrot(q, (XrVector3f){0, 0, -1});
+        g_head_yaw = atan2f(-f.x, -f.z);
+    }
     XrVector3f d = {loc.pose.position.x - ref.position.x, loc.pose.position.y - ref.position.y,
                     loc.pose.position.z - ref.position.z};
     // the head's rotation in the camera's own axes: OpenXR's as they are (cam_sign 1), or turned half round about up

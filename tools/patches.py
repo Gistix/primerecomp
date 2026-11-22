@@ -77,3 +77,32 @@ PATCHES[0x70003c8328] = lambda gen, a: ('{ extern void rt_tick_body(void); rt_ti
 
 # CMovieList::Update(float dt) (the movies' clock): `mov x29, sp` after the runtime logs dt (s0; LARECOMP_TICK_LOG)
 PATCHES[0x70003669f4] = lambda gen, a: '{ c->x[29] = c->sp; extern void rt_movie_dt(Cpu *); rt_movie_dt(c); }'
+
+# VR: the arm cannon in the right hand (runtime/hle/game.c rt_gun_transform, rt_cursor_point; Video tab "VR: aim with
+# your hand"). CPlayerGunMP1::SetTransform(xf) - called directly from 18 places, so not through an override - first
+# lets the runtime point x1 at the hand's transform, then its `ldp x8, x9, [x1]`; CAimingCursorMP1::GetCursorInWorld
+# and ...ForGun (`add x0, x0, #0x94` / `#0xa0`: the point shots are aimed at) the hand's point instead, when it has one.
+PATCHES[0x7000c9d374] = lambda gen, a: ('{ extern void rt_gun_transform(Cpu *); rt_gun_transform(c); '
+                                        'c->x[8] = LD64(c->x[1]); c->x[9] = LD64(c->x[1] + 8); }')
+PATCHES[0x7000cb6d10] = lambda gen, a: ('{ extern uint64_t rt_cursor_point(uint64_t); '
+                                        'c->x[0] = rt_cursor_point(c->x[0] + 0x94); }')
+PATCHES[0x7000cb6d18] = lambda gen, a: ('{ extern uint64_t rt_cursor_point(uint64_t); '
+                                        'c->x[0] = rt_cursor_point(c->x[0] + 0xa0); }')
+# ... and CPlayerMP1::UpdateGunTransform's last two calls, after it places the gun (SetTransform, above):
+# UpdateAimTargetPrediction and UpdateAssistedAiming, which turn the gun toward the aim point with a fixed up
+# (CTransform4f::LookAt - no roll). Skipped while the gun is in the hand (runtime/hle/game.c rt_gun_in_hand), as the
+# Ryujinx VR mod skipped them: its UpdateGunTransform only placed the gun.
+PATCHES[0x7000c69438] = lambda gen, a: ('{ extern int rt_gun_in_hand(void); extern void f_7000c68ae0(Cpu *); '
+                                        'if (!rt_gun_in_hand()) { c->x[30] = 0x7000c6943cull; f_7000c68ae0(c); } }')
+PATCHES[0x7000c69448] = lambda gen, a: ('{ extern int rt_gun_in_hand(void); extern void f_7000c68e74(Cpu *); '
+                                        'if (!rt_gun_in_hand()) { c->x[30] = 0x7000c6944cull; f_7000c68e74(c); } }')
+# ... and CAimingCursorMP1::GetCursorOnPlane (`add x0, x0, #0x10`: where the combat reticle is drawn) along the
+# hand's pointing (runtime/hle/game.c rt_cursor_plane)
+PATCHES[0x7000cb6d00] = lambda gen, a: ('{ extern uint64_t rt_cursor_plane(uint64_t); '
+                                        'c->x[0] = rt_cursor_plane(c->x[0] + 0x10); }')
+# ... and CPlayerGunMP1::Update, which in the pointer aiming mode (the player's +0x69c == 2) turns the drawn gun (gun +
+# 0x1e4) toward GetCursorInWorldForGun - the hand's aim point - with the world's up (CTransform4f::LookAt: no roll).
+# Where its two ways of doing that meet (`ldr x8, [x19, #0x520]`; x19 the gun, x23 = gun + 0x1e4), the runtime turns
+# it about where it points by the hand's roll (runtime/hle/game.c rt_gun_roll).
+PATCHES[0x7000c942e0] = lambda gen, a: ('{ extern void rt_gun_roll(Cpu *); rt_gun_roll(c); '
+                                        'c->x[8] = LD64(c->x[19] + 0x520); }')

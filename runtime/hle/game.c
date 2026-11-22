@@ -1040,6 +1040,8 @@ static _Atomic float g_gun_view_scale = 1;
 static _Atomic uint64_t g_gun_scale_frame;
 float rt_gun_view_scale(void) {
     extern uint64_t vk_frame_counter(void);
+    extern bool xr_on(void);  // (VR: the gun at its own size and place - in the hand, or in front, seen in stereo)
+    if (xr_on()) return 1;
     return g_gun_scale_frame && vk_frame_counter() <= g_gun_scale_frame + 3 ? g_gun_view_scale : 1;
 }
 static int rt_weapon_fov(void) {
@@ -1372,6 +1374,7 @@ static void rt_fp_think(Cpu *c) {
 // stick's, gyro's or mouse's. Which pose went into which drawn frame: xr.c (xr_note_view).
 static uint64_t g_vr_cam;
 static float g_vr_saved[12];
+static bool g_vr_saved_ok;  // (g_vr_saved holds a first-person camera's transform: vr_hand_gun's facing)
 static float *vr_cam_transform(Cpu *c, uint64_t cam) {  // (CActorMP1::GetTransform: a pointer to the actor's own)
     Cpu *saved = malloc(sizeof *saved);
     *saved = *c;
@@ -1406,6 +1409,7 @@ static void vr_head_apply(Cpu *c, uint64_t cam, uint64_t sm) {
     float *m = vr_cam_transform(c, cam);
     if (!m) return;
     memcpy(g_vr_saved, m, 48);
+    g_vr_saved_ok = true;
     float n[12];
     for (int i = 0; i < 3; i++) {  // the rotation: the camera's axes (columns) turned by the head's, in the camera's
         for (int j = 0; j < 3; j++) n[i * 4 + j] = m[i * 4] * h[j] + m[i * 4 + 1] * h[3 + j] + m[i * 4 + 2] * h[6 + j];
@@ -1428,6 +1432,224 @@ static void vr_head_apply(Cpu *c, uint64_t cam, uint64_t sm) {
     vr_cam_set(c, cam, n);
     g_vr_cam = cam;
     xr_head_used(id, n);
+}
+
+// ---- VR: the arm cannon in the right hand (Video tab "VR: aim with your hand"; runtime/nvn/vulkan/xr.c xr_hand).
+// The gun's transform (CPlayerGunMP1::SetTransform, which every placing of it goes through) is turned by the hand's
+// turn from Samus' facing - about up, the camera's as the game made it (g_vr_saved), whatever the gun model's axes -
+// and put at the hand: Samus' eye (her place and eye height) plus the hand's place from the recentered head, in her
+// facing, drawn back VR_GUN_BACK along it. As in the Ryujinx VR mod, CPlayerMP1::UpdateGunTransform then stops there
+// (its assisted aiming: tools/patches.py, rt_gun_in_hand). CPlayerGunMP1::Update draws the gun from that transform, in
+// the pointer aiming mode turned toward the aim point with the world's up - the hand's roll is put back after
+// (rt_gun_roll). Shots start from the gun and aim at the cursor's point in the world (CPlayerGunMP1::FirePrimary:
+// CTransform4f::LookAt it): a point far along the hand's pointing (CAimingCursorMP1::GetCursorInWorld / ...ForGun) -
+// locked on, the target, and the gun is turned to point at it (its roll kept), wherever the view looks.
+#define VR_HAND_SCALE 2.0f  // (game units per metre the hand moves: the Ryujinx VR mod's)
+#define VR_GUN_BACK 0.55f   // (the gun drawn back along where it points: the mod's)
+static bool g_hand_on;       // (the gun was put in the hand lately - the cursor follows it)
+static uint64_t g_hand_frame;
+static float g_hand_pos[3];   // (the gun's place in the hand, in the world)
+static float g_hand_up[3];    // (the hand's up, in the world: rt_gun_roll)
+static float *g_hand_cursor;  // (guest-visible: the cursor's point the game reads)
+
+// The point the game locks onto (+0x4f0: what CPlayerMP1::GetHUDOrbitTargetPosition shows) while locked on (the
+// orbit state, +0x4e0), and the way to it from the gun in the hand. (Never the origin: +0x5e4, tried first, read that.)
+static bool vr_lock_target(float at[3], float fwd[3]) {
+    if (!GUEST_PTR_OK(g_player) || LD32(g_player + 0x4e0) == 0) return false;
+    const float *t = (const float *)(uintptr_t)(g_player + 0x4f0);
+    float l = 0;
+    for (int i = 0; i < 3; i++) {
+        if (!isfinite(t[i])) return false;
+        at[i] = t[i], fwd[i] = t[i] - g_hand_pos[i], l += fwd[i] * fwd[i];
+    }
+    if (l < 0.25f || fabsf(t[0]) + fabsf(t[1]) + fabsf(t[2]) < 1e-3f) return false;
+    l = sqrtf(l);
+    for (int i = 0; i < 3; i++) fwd[i] /= l;
+    return true;
+}
+
+static bool vr_hand_gun(Cpu *c, const float gun[12], float out[12]) {
+    extern bool xr_hand(float rot[9], float pos[3]);
+    extern int xr_cam_sign(void);
+    float h[9], hp[3];
+    uint64_t player = g_player;
+    // (not before a first-person camera was seen, morphed, out of play, or without the right controller's pose)
+    if (!g_vr_saved_ok || !GUEST_PTR_OK(player) || LD32(player + 0x4d4) != 0 || !game_in_play() || !xr_hand(h, hp))
+        return false;
+    float *pm = player_transform(player);
+    if (!pm) return false;
+    // Samus' facing about up (the camera's view axis, flattened) as the camera's axes: x = up x z
+    float sg = (float)xr_cam_sign(), *m = g_vr_saved;
+    float zx = m[2], zz = m[10], zl = sqrtf(zx * zx + zz * zz);
+    if (zl < 1e-4f) return false;
+    zx /= zl, zz /= zl;
+    float Y[9] = {zz, 0, zx, 0, 1, 0, -zx, 0, zz};  // (row-major; columns x = (zz, 0, -zx), y up, z = (zx, 0, zz))
+    // the hand's rotation in the world, and the turn D from Samus' facing to it (world axes: D = Y H Y^T)
+    float W[9], D[9];
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++) W[i * 3 + j] = Y[i * 3] * h[j] + Y[i * 3 + 1] * h[3 + j] + Y[i * 3 + 2] * h[6 + j];
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++) D[i * 3 + j] = W[i * 3] * Y[j * 3] + W[i * 3 + 1] * Y[j * 3 + 1] + W[i * 3 + 2] * Y[j * 3 + 2];
+    for (int i = 0; i < 3; i++)  // the gun's rotation turned by D
+        for (int j = 0; j < 3; j++) out[i * 4 + j] = D[i * 3] * gun[j] + D[i * 3 + 1] * gun[4 + j] + D[i * 3 + 2] * gun[8 + j];
+    // where it points (the camera's view axis, turned with the hand) and Samus' eye
+    float fwd[3];
+    for (int i = 0; i < 3; i++) fwd[i] = -sg * W[i * 3 + 2], g_hand_up[i] = W[i * 3 + 1];
+    Cpu *saved = malloc(sizeof *saved);
+    *saved = *c;
+    c->x[0] = player;
+    guest_call(c, guest_sym("_ZNK10CPlayerMP112GetEyeHeightEv"));
+    float eye_h;
+    uint32_t eb = (uint32_t)c->v[0];
+    memcpy(&eye_h, &eb, 4);
+    *c = *saved;
+    free(saved);
+    if (!(eye_h > 0 && eye_h < 10)) return false;
+    // Where, as the Ryujinx VR mod placed it (CPlayerMP1::UpdateGunTransform there): Samus' eye (her place and eye
+    // height) plus the hand's place from the recentered head times VR_HAND_SCALE (the mod's 2: game units per metre
+    // of hand movement), drawn back VR_GUN_BACK (the mod's 0.55) along where the hand points. (The weapon field of
+    // view's scaling is off in VR: rt_gun_view_scale - with it on the gun was drawn 2.46 times too big.)
+    float hc[3] = {sg * hp[0], hp[1], sg * hp[2]};  // (the hand's place in the camera's axes, world scale applied)
+    float ws = g_settings.vr_world_scale > 0.1f ? g_settings.vr_world_scale : 1.0f;
+    float eye[3] = {pm[3], pm[7] + eye_h, pm[11]};
+    for (int i = 0; i < 3; i++) {
+        float p = eye[i] + (Y[i * 3] * hc[0] + Y[i * 3 + 1] * hc[1] + Y[i * 3 + 2] * hc[2]) * VR_HAND_SCALE / ws - fwd[i] * VR_GUN_BACK;
+        out[i * 4 + 3] = p, g_hand_pos[i] = p;
+        if (!g_hand_cursor) g_hand_cursor = hle_alloc(16);
+        g_hand_cursor[i] = p + fwd[i] * 100.0f;  // (the cursor's point: 100 units along the pointing)
+    }
+    // Locked on: the gun turned from where the hand points to the target, the least turn (about their cross product)
+    float at[3], to[3];
+    if (vr_lock_target(at, to)) {
+        float ax[3] = {fwd[1] * to[2] - fwd[2] * to[1], fwd[2] * to[0] - fwd[0] * to[2], fwd[0] * to[1] - fwd[1] * to[0]};
+        float s = sqrtf(ax[0] * ax[0] + ax[1] * ax[1] + ax[2] * ax[2]), co = fwd[0] * to[0] + fwd[1] * to[1] + fwd[2] * to[2];
+        if (s > 1e-5f) {
+            float x = ax[0] / s, y = ax[1] / s, z = ax[2] / s, t = 1 - co;
+            float Q[9] = {t * x * x + co, t * x * y - s * z, t * x * z + s * y,  // (Rodrigues: sine s, cosine co)
+                          t * x * y + s * z, t * y * y + co, t * y * z - s * x,
+                          t * x * z - s * y, t * y * z + s * x, t * z * z + co};
+            float r[9];
+            for (int i = 0; i < 3; i++)
+                for (int j = 0; j < 3; j++)
+                    r[i * 3 + j] = Q[i * 3] * out[j] + Q[i * 3 + 1] * out[4 + j] + Q[i * 3 + 2] * out[8 + j];
+            for (int i = 0; i < 3; i++)
+                for (int j = 0; j < 3; j++) out[i * 4 + j] = r[i * 3 + j];
+        }
+    }
+    return true;
+}
+
+// From CPlayerGunMP1::SetTransform's first instruction (tools/patches.py): x1 the transform it's given - pointed at
+// the hand's instead. Every register but x1 as it was.
+void rt_gun_transform(Cpu *c) {
+    extern uint64_t vk_frame_counter(void);
+    static float *xf;
+    const float *gun = (const float *)(uintptr_t)c->x[1];
+    float out[12];
+    if (GUEST_PTR_OK(c->x[1]) && vr_hand_gun(c, gun, out)) {
+        if (!xf) xf = hle_alloc(64);
+        memcpy(xf, out, 48);
+        c->x[1] = (uint64_t)(uintptr_t)xf;
+        if (!g_hand_on) LOG("[vr] the arm cannon in the right hand\n");
+        g_hand_on = true, g_hand_frame = vk_frame_counter();
+    } else if (g_hand_on && vk_frame_counter() > g_hand_frame + 2) {
+        g_hand_on = false;
+        LOG("[vr] the arm cannon where the game puts it\n");
+    }
+}
+
+static bool vr_hand_live(void) {  // (the gun was put in the hand lately)
+    extern uint64_t vk_frame_counter(void);
+    return g_hand_on && g_hand_cursor && vk_frame_counter() <= g_hand_frame + 2 && GUEST_PTR_OK(g_player);
+}
+
+// From CPlayerMP1::UpdateGunTransform's calls to UpdateAimTargetPrediction / UpdateAssistedAiming (tools/patches.py):
+// nonzero skips them - the gun in the hand stays as it was put there (rt_gun_transform)
+int rt_gun_in_hand(void) {
+    return vr_hand_live();
+}
+
+// Where the gun in the hand aims (the world): far along the hand's pointing, or locked on, the target (vr_lock_target)
+// - wherever the view looks. False: the game's own.
+static bool vr_aim(float at[3]) {
+    float to[3];
+    if (!vr_hand_live()) return false;
+    if (vr_lock_target(at, to)) return true;
+    if (LD32(g_player + 0x4e0) != 0) return false;  // (locked on, no target point: the game's)
+    memcpy(at, g_hand_cursor, 12);
+    return true;
+}
+
+// From CPlayerGunMP1::Update (tools/patches.py; the gun in x19, x23 = gun + 0x1e4, the transform it's drawn with),
+// after the pointer aiming mode turned it toward the aim point with the world's up (CVector3f::skUpVector) - no roll.
+// With the gun in the hand it's turned about where it points by the hand's roll: the angle from the world's up to the
+// hand's, both square to that. (Where it points: of its axes, the one nearest the way to the aim point - the gun
+// model's own axes aren't assumed.)
+void rt_gun_roll(Cpu *c) {
+    float at[3];
+    if (!vr_hand_live() || c->x[23] != c->x[19] + 0x1e4 || LD64(g_player + 0x690) != c->x[19] || !vr_aim(at)) return;
+    float *xf = (float *)(uintptr_t)c->x[23], to[3], l = 0;
+    for (int i = 0; i < 3; i++) to[i] = at[i] - xf[i * 4 + 3], l += to[i] * to[i];
+    if (l < 1e-6f) return;
+    float f[3], best = 0;
+    for (int j = 0; j < 3; j++) {  // (column j: axis j in the world)
+        float cl = 0, d = 0;
+        for (int i = 0; i < 3; i++) cl += xf[i * 4 + j] * xf[i * 4 + j], d += xf[i * 4 + j] * to[i];
+        if (cl < 1e-6f) continue;
+        d /= sqrtf(cl * l);
+        if (fabsf(d) > fabsf(best)) {
+            best = d;
+            for (int i = 0; i < 3; i++) f[i] = xf[i * 4 + j] / sqrtf(cl) * (d < 0 ? -1.0f : 1.0f);
+        }
+    }
+    if (fabsf(best) < 0.7f) return;
+    const float wu[3] = {0, 1, 0};
+    float a[3], b[3], da = 0, db = 0, la = 0, lb = 0;
+    for (int i = 0; i < 3; i++) da += wu[i] * f[i], db += g_hand_up[i] * f[i];
+    for (int i = 0; i < 3; i++) a[i] = wu[i] - da * f[i], b[i] = g_hand_up[i] - db * f[i];
+    for (int i = 0; i < 3; i++) la += a[i] * a[i], lb += b[i] * b[i];
+    if (la < 1e-6f || lb < 1e-6f) return;
+    float ab[3] = {a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]};
+    float th = atan2f(ab[0] * f[0] + ab[1] * f[1] + ab[2] * f[2], a[0] * b[0] + a[1] * b[1] + a[2] * b[2]);
+    float co = cosf(th), s = sinf(th), t = 1 - co, x = f[0], y = f[1], z = f[2];
+    float Q[9] = {t * x * x + co, t * x * y - s * z, t * x * z + s * y,  // (Rodrigues: th about f)
+                  t * x * y + s * z, t * y * y + co, t * y * z - s * x,
+                  t * x * z - s * y, t * y * z + s * x, t * z * z + co};
+    float r[9];
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++) r[i * 3 + j] = Q[i * 3] * xf[j] + Q[i * 3 + 1] * xf[4 + j] + Q[i * 3 + 2] * xf[8 + j];
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++) xf[i * 4 + j] = r[i * 3 + j];
+}
+
+// From CAimingCursorMP1::GetCursorInWorld / ...ForGun (tools/patches.py): the cursor's point in the world - vr_aim's
+// with the gun in the hand - else the game's (`point`). (Written into the cursor itself instead, as the Ryujinx VR mod
+// did, the shots went to the reticle again: the cursor's own update makes those fields from the view's middle - and
+// the reticle didn't follow either.)
+uint64_t rt_cursor_point(uint64_t point) {
+    static float *p;
+    float at[3];
+    if (!vr_aim(at)) return point;
+    if (!p) p = hle_alloc(16);
+    memcpy(p, at, 12);
+    return (uint64_t)(uintptr_t)p;
+}
+
+// From CAimingCursorMP1::GetCursorOnPlane (tools/patches.py): the point 1.25 ahead of the camera the combat reticle
+// is drawn at (CReticleCombatAiming / CReticleCrosshair::Update) - with the gun in the hand, where the line from the
+// camera to vr_aim's point crosses that plane, so the reticle shows where the shots go (locked on: on the target).
+uint64_t rt_cursor_plane(uint64_t point) {
+    extern int xr_cam_sign(void);
+    float at[3];
+    if (!g_vr_saved_ok || !vr_aim(at)) return point;
+    const float *m = g_vr_saved, sg = (float)xr_cam_sign();
+    float cam[3] = {m[3], m[7], m[11]}, f[3] = {-sg * m[2], -sg * m[6], -sg * m[10]}, d[3], along = 0;
+    for (int i = 0; i < 3; i++) d[i] = at[i] - cam[i], along += d[i] * f[i];
+    if (along < 1e-3f) return point;
+    static float *p;
+    if (!p) p = hle_alloc(16);
+    for (int i = 0; i < 3; i++) p[i] = cam[i] + d[i] * 1.25f / along;
+    return (uint64_t)(uintptr_t)p;
 }
 
 static void vr_head_restore_cam(Cpu *c, uint64_t cam) {  // (before Think: this camera as Think left it last)

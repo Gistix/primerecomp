@@ -1030,6 +1030,15 @@ static void fill_state(Cpu *c) {
     int32_t plx = legacy || map_swap ? pad_rx : pad_lx, ply = map_swap ? pad_ry : pad_ly;
     int32_t lx = clamp_axis((menu ? 0 : key_lx + plx + wm_lx) + script_lx);
     int32_t ly = clamp_axis((menu ? 0 : key_ly + ply + wm_ly) + script_ly);
+    {   // VR (Video tab "VR: move where you look"): the move stick turned by how far the head is turned from Samus'
+        // facing - forward goes where the player looks, Samus keeps facing (and aiming) where she did
+        extern bool xr_head_yaw(float *yaw);
+        float yaw;
+        if (g_settings.vr_move_head && !legacy && !map_swap && (lx || ly) && game_in_play() && xr_head_yaw(&yaw)) {
+            float c = cosf(yaw), s = sinf(yaw), x = (float)lx, y = (float)ly;
+            lx = clamp_axis((int32_t)lroundf(x * c - y * s)), ly = clamp_axis((int32_t)lroundf(x * s + y * c));
+        }
+    }
     int32_t prx = legacy || map_swap ? pad_lx : flick_takes_stick ? 0 : pad_rx;
     int32_t pry = map_swap ? pad_ly : flick_takes_stick ? 0 : pad_ry;
     int32_t rx = clamp_axis((menu ? 0 : key_rx + prx + mouse_rx + wm_rx) + script_rx);

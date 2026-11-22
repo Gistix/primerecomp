@@ -40,6 +40,8 @@ Settings g_settings = {
     .vr_world_scale = 1.0f,
     .vr_stereo = true,
     .vr_res_pct = 80,
+    .vr_move_head = true,
+    .vr_hand_aim = true,
     .head_bob = true,
     .camera_shake = true,
     .hint_on_l3 = true,
@@ -243,6 +245,10 @@ void settings_load(void) {
             if (v >= VR_SCREEN_WIDTH_MIN && v <= VR_SCREEN_WIDTH_MAX) g_settings.vr_screen_width = v;
         } else if (!strcmp(key, "vr_stereo")) {
             g_settings.vr_stereo = atoi(val) != 0;
+        } else if (!strcmp(key, "vr_move_head")) {
+            g_settings.vr_move_head = atoi(val) != 0;
+        } else if (!strcmp(key, "vr_hand_aim")) {
+            g_settings.vr_hand_aim = atoi(val) != 0;
         } else if (!strcmp(key, "vr_resolution")) {
             int v = atoi(val);
             if (v >= VR_RES_MIN && v <= VR_RES_MAX) g_settings.vr_res_pct = v;
@@ -413,6 +419,8 @@ static void write_settings(void *o) {
     put(o, "vr_world_scale = %.2f\n", g_settings.vr_world_scale);
     put(o, "vr_stereo = %d\n", g_settings.vr_stereo);
     put(o, "vr_resolution = %d\n", g_settings.vr_res_pct);
+    put(o, "vr_move_head = %d\n", g_settings.vr_move_head);
+    put(o, "vr_hand_aim = %d\n", g_settings.vr_hand_aim);
     put(o, "preload_shaders = %d\n", g_settings.preload_shaders);
     put(o, "texture_mods = %d\ndump_textures = %d\n", g_settings.texture_mods, g_settings.dump_textures);
     if (g_settings.mods_order[0]) put(o, "mods_order = %s\n", g_settings.mods_order);
