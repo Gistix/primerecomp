@@ -5088,13 +5088,15 @@ static uint32_t cpu_vs_index(const CpuVs *c, uint32_t j) {
 }
 
 // NDC x of vertex v (an index as drawn) in instance n; false if it can't be run or is behind the camera
+// (the axis cpu_vs_x reads: 0 x, 1 y - VR's tall image sorts the HUD's pieces by height: draw_)
+static int g_hud_axis;
 static bool cpu_vs_x(const CpuVs *c, uint32_t v, uint32_t n, float *x) {
     float at[32][4], p[4];
     v += (uint32_t)c->base_vertex;
     for (int i = 0; i < 32; i++)
         if (((c->attrs >> i) & 1) && !cpu_attr(i, v, c->base_inst, n, at[i])) return false;
     if (!maxwell_vsim_run(c->pr->vsim, (const float (*)[4])at, c->cb, c->cbsz, p) || !(p[3] > 0)) return false;
-    *x = p[0] / p[3];
+    *x = p[g_hud_axis] / p[3];
     return true;
 }
 
@@ -5137,11 +5139,41 @@ static bool spans_screen(Prog *pr, CmdRec *r, bool indexed) {
 #define HUD_PIECES_MAX 12288  // (indices: longer lists are taken as one piece)
 #define HUD_INST_MAX 64       // (instances: more are taken as one piece)
 #define HUD_GAP 0.05f
-typedef struct { uint32_t *idx, n[3]; int8_t *inst_side; float lo, hi; /* the draw's x extent (box NDC) */ } HudSplit;
+// (VR's tall image, g_hud_axis 1: pieces sorted by height into 2 * HUD_BANDS + 1 bands instead of three sides - a
+// piece in band b moves b / HUD_BANDS of the way to the image's edge, as the helmet's frame stretched about the middle
+// takes the point it sits at: the HUD keeps its place on the frame. split->band: the whole draw's band, hud_side 4 -
+// then it moves by its own middle exactly (draw_): the HUD sways, and a piece at a band's edge (the radar, the map)
+// jumped between two bands' shifts. Fine bands for the rest: what's left of that is a step of 1/14th. One more group,
+// HUD_STRETCH: tall pieces - the frame's holograms, its corner brackets and side bars - stretched to the image's height
+// about the middle as the helmet's frame is, so they still frame it; moved, they kept the 16:9 box's height. 30 groups,
+// within hud_group's int of the groups seen.)
+#define HUD_BANDS 14
+#define HUD_STRETCH (HUD_BANDS + 1)
+#define HUD_TALL 0.6f  // (a piece this tall - box NDC, of 2 - or taller is stretched)
+#define HUD_GROUPS (2 * HUD_BANDS + 2)
+typedef struct { uint32_t *idx, n[HUD_GROUPS]; int8_t *inst_side; float lo, hi; /* the draw's x extent (box NDC) */
+                 int band; } HudSplit;
+static int hud_half(void) { return g_hud_axis ? HUD_BANDS : 1; }  // (groups each side of the middle)
 
+// (the HUD box's units over the draw's: 1, or for a camera-drawn HUD model on the whole tall image its 16:9 box's
+// height over the image's - draw_)
+static float g_hud_yscale = 1;
 static int hud_piece_side(float x0, float x1) {
+    if (g_hud_axis) x0 *= g_hud_yscale, x1 *= g_hud_yscale;
     float c = (x0 + x1) * 0.5f;
+    if (g_hud_axis) {
+        if (x1 - x0 >= HUD_TALL) return HUD_STRETCH;
+        int b = (int)lroundf(c * HUD_BANDS);
+        return b < -HUD_BANDS ? -HUD_BANDS : b > HUD_BANDS ? HUD_BANDS : b;
+    }
     return x1 - x0 > 1.0f ? 0 : c < -HUD_SIDE ? -1 : c > HUD_SIDE ? 1 : 0;
+}
+// a single side / band seen (one bit of seen): it, else HUD_GROUPS
+static int hud_single(int seen) {
+    if (!seen || (seen & (seen - 1))) return HUD_GROUPS;
+    int b = 0;
+    while (!(seen >> b & 1)) b++;
+    return b - hud_half();
 }
 
 static const float *hud_sort_lo;
@@ -5164,7 +5196,7 @@ static int hud_group(uint32_t n, const float *lo, const float *hi, int8_t *side,
         while (j < n && lo[order[j]] < chi + HUD_GAP) chi = fmaxf(chi, hi[order[j]]), j++;
         int8_t sd = (int8_t)hud_piece_side(clo, chi);
         for (uint32_t k = i; k < j; k++) side[order[k]] = sd;
-        seen |= 1 << (sd + 1);
+        seen |= 1 << (sd + hud_half());
         if (lg) LOG("[hud] frame %llu: fs %016llx vs %llx, %llu vertices: %u piece(s) x %.3f .. %.3f: %s\n",
                     (unsigned long long)renderer_present_count(), (unsigned long long)g_cur_fs_hash,
                     (unsigned long long)pr->code[0], (unsigned long long)r->x[2], j - i, clo, chi,
@@ -5186,9 +5218,13 @@ static int hud_side(Prog *pr, CmdRec *r, bool indexed, HudSplit *split) {
     bool lg = log_hud && fr >= lh_from && fr <= lh_to;
     CpuVs c;
     uint32_t count = (uint32_t)r->x[2];
+    // (VR's tall image: a draw whose pieces aren't worked out is stretched as the helmet's frame is - every point of
+    // it where the stretched frame takes that point: the lights on the frame's top bar went with the frame then)
     if (!cpu_vs_init(&c, pr, r, indexed)) {
-        if (lg) LOG("[hud] frame %ld: fs %016llx vs %llx, %u vertices: middle (vertex shader not simple)\n", fr,
-                    (unsigned long long)g_cur_fs_hash, (unsigned long long)pr->code[0], count);
+        if (lg) LOG("[hud] frame %ld: fs %016llx vs %llx, %u vertices: %s (vertex shader not simple)\n", fr,
+                    (unsigned long long)g_cur_fs_hash, (unsigned long long)pr->code[0], count,
+                    g_hud_axis ? "stretched" : "middle");
+        if (g_hud_axis) return split->band = HUD_STRETCH, 4;
         return 0;
     }
     if (c.inst > 1 || r->x[0] != 4 || count < 6 || count > HUD_PIECES_MAX) {
@@ -5215,7 +5251,8 @@ static int hud_side(Prog *pr, CmdRec *r, bool indexed, HudSplit *split) {
             split->lo = lo[0], split->hi = hi[0];
             for (uint32_t p = 1; p < np; p++) split->lo = fminf(split->lo, lo[p]), split->hi = fmaxf(split->hi, hi[p]);
         }
-        if (seen == 1 || seen == 2 || seen == 4) res = seen == 1 ? -1 : seen == 4 ? 1 : 0;
+        int one = hud_single(seen);
+        if (one != HUD_GROUPS) res = !g_hud_axis ? one : one ? (split->band = one, 4) : 0;
         else if (seen && c.inst_step1) res = 3, split->inst_side = side, side = NULL;  // (instances apart)
         if (lg) {
             if (!ok) LOG("[hud] frame %ld: fs %016llx vs %llx, %u vertices x %u: middle (not worked out)\n", fr,
@@ -5228,6 +5265,7 @@ static int hud_side(Prog *pr, CmdRec *r, bool indexed, HudSplit *split) {
             }
         }
         free(lo), free(hi), free(side);
+        if (!ok && g_hud_axis) return split->band = HUD_STRETCH, 4;  // (not worked out: stretched - above)
         return res;
     }
     // pieces: the triangles' vertices in a hash table (index -> slot), joined by union-find over slots
@@ -5273,16 +5311,17 @@ static int hud_side(Prog *pr, CmdRec *r, bool indexed, HudSplit *split) {
         int seen = hud_group(npiece, lo, hi, side_of, lg, r, pr);
         split->lo = 1e30f, split->hi = -1e30f;
         for (uint32_t p = 0; p < npiece; p++) split->lo = fminf(split->lo, lo[p]), split->hi = fmaxf(split->hi, hi[p]);
-        if (seen == 1 || seen == 2 || seen == 4) {
-            side = seen == 1 ? -1 : seen == 4 ? 1 : 0;
-        } else {  // in parts
+        int one = hud_single(seen), h = hud_half();
+        if (one != HUD_GROUPS) {
+            side = !g_hud_axis ? one : one ? (split->band = one, 4) : 0;
+        } else {  // in parts (grouped by side, or band: hud_half each side of the middle)
             side = 2;
             split->idx = malloc(ntri * 3 * 4);
-            uint32_t at[3] = {0};
-            for (uint32_t t = 0; t < ntri; t++) split->n[side_of[piece[FIND(tri_slot[t])]] + 1] += 3;
-            at[1] = split->n[0], at[2] = split->n[0] + split->n[1];
+            uint32_t at[HUD_GROUPS] = {0};
+            for (uint32_t t = 0; t < ntri; t++) split->n[side_of[piece[FIND(tri_slot[t])]] + h] += 3;
+            for (int g = 1; g < (g_hud_axis ? HUD_GROUPS : 3); g++) at[g] = at[g - 1] + split->n[g - 1];
             for (uint32_t t = 0; t < ntri; t++) {
-                int s = side_of[piece[FIND(tri_slot[t])]] + 1;
+                int s = side_of[piece[FIND(tri_slot[t])]] + h;
                 for (int k = 0; k < 3; k++) split->idx[at[s] + k] = cpu_vs_index(&c, t * 3 + k);
                 at[s] += 3;
             }
@@ -5293,6 +5332,7 @@ static int hud_side(Prog *pr, CmdRec *r, bool indexed, HudSplit *split) {
                 (unsigned long long)pr->code[0], count, !ok ? "middle (not worked out)" : side == 2 ? "in parts" :
                 side < 0 ? "left" : side > 0 ? "right" : "middle");
     free(key), free(par), free(piece), free(vx), free(lo), free(hi), free(tri_slot), free(side_of);
+    if (!ok && g_hud_axis) return split->band = HUD_STRETCH, 4;  // (not worked out: stretched - above)
     return side;
 }
 
@@ -5494,6 +5534,90 @@ static void draw_(CmdRec *r, bool indexed) {
                 hud = hud_side(pr, r, indexed, &hud_split);
                 if (hud == -1 || hud == 1) hud_dx = hud * hud_far;
                 if (hud == 0 && hud_split.hi - hud_split.lo > 2.2f) hud_k = tw / bw;
+            }
+        }
+    }
+    // VR (runtime/nvn/vulkan/xr.c xr_shape): a target taller than 16:9 - the eyes' view's shape - the same, turned a
+    // quarter: the HUD's pieces at the top and bottom of its box go to the image's top and bottom (hud_side along y:
+    // g_hud_axis), the helmet's frame is stretched to the image's height (hud_kv) and meets its dark outline (a model
+    // in front of the camera: not boxed, it fills the image)
+    float hud_dy = 0, hud_far_y = 0, hud_kv = 1, hud_stretch_sy = 0, hud_stretch_oy = 0;
+    bool hud_vert = false, hud_cam = false;  // (hud_cam: a camera-drawn HUD model, below)
+    if (boxed && pass_sy > pass_sx * 1.01f) {
+        extern bool game_in_play(void);  // runtime/hle/game.c
+        int pw, ph;
+        pass_size(&pw, &ph);
+        float u = fminf(pass_sx, pass_sy), bh = st.rt.color[0]->height * u;
+        hud_far_y = floorf(((float)ph - bh) * 0.5f);
+        // (the shader's +y is up; the game's images start at the lower left, so up is down the target's rows there)
+        float ys = renderer_origin_lower_left() ? 1.0f : -1.0f;
+        if (visor_film(g_cur_fs_hash)) hud_kv = (float)ph / bh;
+        else if (on_glass()) {}
+        else if (hud_far_y >= 1 && game_in_play()) {
+            // (the screen-framing overlays too, unlike the ultrawide's - those have their edge stretch: the lights on
+            // the helmet's frame, small quads, share the visor's power-on shader; a full-screen one is tall: stretched)
+            if (helmet_frame(r)) hud_kv = (float)ph / bh;
+            else {
+                g_hud_axis = 1;
+                hud = hud_side(pr, r, indexed, &hud_split);
+                g_hud_axis = 0;
+                hud_vert = true;
+                if (hud == 4 && hud_split.band == HUD_STRETCH) {  // (all of it tall: stretched, as the frame)
+                    hud_kv = (float)ph / bh;
+                } else if (hud == 4) {  // (the whole draw in one band: by its own middle, exactly)
+                    float c = (hud_split.lo + hud_split.hi) * 0.5f;
+                    hud_dy = ys * fmaxf(-1.0f, fminf(1.0f, c)) * hud_far_y;
+                }
+                hud_stretch_sy = u * (float)ph / bh;  // (in parts: the tall ones' - draw)
+                hud_stretch_oy = ((float)ph - st.rt.color[0]->height * hud_stretch_sy) * 0.5f;
+                if (g_debug_frame) {  // (F9: how each HUD draw was placed on VR's tall image)
+                    LOG("[draw]   tall (boxed):\n");
+                    char parts[200] = "";
+                    for (int g = 0, at = 0; hud_split.idx && g < HUD_GROUPS; g++)
+                        if (hud_split.n[g]) at += snprintf(parts + at, sizeof parts - at, " %d:%u", g - HUD_BANDS, hud_split.n[g]);
+                    LOG("[draw]   tall: hud %d band %d y %.3f .. %.3f, dy %.1f kv %.3f%s%s\n", hud, hud_split.band,
+                        hud_split.lo, hud_split.hi, hud_dy, hud_kv, parts[0] ? " parts (band:indices)" : "", parts);
+                }
+                if (hud == 0 && hud_split.hi - hud_split.lo > 2.2f) hud_kv = (float)ph / bh;
+            }
+        }
+    }
+    // ... and the HUD's small models drawn through a camera of their own (not boxed: ui_boxed's camera test - the
+    // lights on the helmet's frame): that camera keeps its width and takes its height from the narrowed aspect, so on
+    // the tall image they come out where a 16:9 box in the middle would put them. They get the HUD's treatment too,
+    // their heights read in that box's units (g_hud_yscale: the image's over the box's).
+    if (!boxed && pass_sy > pass_sx * 1.01f && st.rt.ncolor && st.rt.color[0] && renderer_texture_presented(st.rt.color[0]) &&
+        !pr->has_gs && !pr->gs_emul && ((pr->vi->cbuf_mask >> 3) & 1)) {
+        extern bool game_in_play(void);
+        float dz0 = st.depth_range[0][0], dz1 = st.depth_range[0][1];
+        Range u0 = st.ubuf[0][0];
+        const float *m = u0.addr && u0.size >= 64 ? (const float *)(uintptr_t)u0.addr : NULL;
+        float want = (16.0f / 9.0f) * (pass_sx / pass_sy);
+        bool cam = m && m[0] != 0 && fabsf(fabsf(m[5] / m[0]) / want - 1) < 0.01f;
+        static int on = -1;  // (off: these were the crosshair's pieces, at the aim point - LARECOMP_VR_CAMHUD=1 tries it)
+        if (on < 0) on = getenv("LARECOMP_VR_CAMHUD") != NULL;
+        if (on && cam && dz1 <= 0.0391f && !(dz0 == 0.009765623f && dz1 == 0.038671874f) && game_in_play() &&
+            !edge_overlay(g_cur_fs_hash)) {
+            int pw, ph;
+            pass_size(&pw, &ph);
+            float k = pass_sy / pass_sx, bh = st.rt.color[0]->height * pass_sx;  // (the 16:9 box: the image's width)
+            float ys = renderer_origin_lower_left() ? 1.0f : -1.0f;
+            hud_far_y = floorf(((float)ph - bh) * 0.5f);
+            if (hud_far_y >= 1) {
+                g_hud_axis = 1, g_hud_yscale = k;
+                hud = hud_side(pr, r, indexed, &hud_split);
+                g_hud_axis = 0, g_hud_yscale = 1;
+                hud_vert = hud_cam = true;
+                if (hud == 4 && hud_split.band == HUD_STRETCH) hud_kv = k;
+                else if (hud == 4) {
+                    float c = (hud_split.lo + hud_split.hi) * 0.5f * k;
+                    hud_dy = ys * fmaxf(-1.0f, fminf(1.0f, c)) * hud_far_y;
+                }
+                hud_stretch_sy = pass_sy * k;
+                hud_stretch_oy = ((float)ph - st.rt.color[0]->height * hud_stretch_sy) * 0.5f;
+                if (g_debug_frame)
+                    LOG("[draw]   tall (camera-drawn HUD): hud %d band %d y %.3f .. %.3f (x%.3f), dy %.1f kv %.3f\n", hud,
+                        hud_split.band, hud_split.lo, hud_split.hi, k, hud_dy, hud_kv);
             }
         }
     }
@@ -5714,9 +5838,15 @@ static void draw_(CmdRec *r, bool indexed) {
         int pw, ph;
         pass_size(&pw, &ph);
         float u = fminf(pass_sx, pass_sy);
-        vp_sx = u * hud_k, vp_sy = u;
+        vp_sx = u * hud_k, vp_sy = u * hud_kv;
         vp_ox = (pw - st.rt.color[0]->width * vp_sx) * 0.5f + hud_dx;
-        vp_oy = (ph - st.rt.color[0]->height * u) * 0.5f;
+        vp_oy = (ph - st.rt.color[0]->height * vp_sy) * 0.5f + hud_dy;
+    }
+    if (hud_cam) {  // (a camera-drawn HUD model on VR's tall image: moved, or stretched about the middle - above)
+        int pw, ph;
+        pass_size(&pw, &ph);
+        vp_sy = pass_sy * hud_kv;
+        vp_oy = (ph - st.rt.color[0]->height * vp_sy) * 0.5f + hud_dy;
     }
     {
         // (edge stretch: the viewport is the whole target, the vertex shader puts the box in its middle; fragments
@@ -5819,7 +5949,8 @@ static void draw_(CmdRec *r, bool indexed) {
         }
     }
     if (hud_split.idx) {  // (drawn in parts: the triangles regrouped - the same vertices)
-        icount = hud_split.n[0] + hud_split.n[1] + hud_split.n[2];
+        icount = 0;
+        for (int g = 0; g < HUD_GROUPS; g++) icount += hud_split.n[g];
         ib = vk_transient_copy(hud_split.idx, (uint64_t)icount * 4 + 4, 4);
         itype_vk = VK_INDEX_TYPE_UINT32;
         use_index = true;
@@ -5870,13 +6001,17 @@ static void draw_(CmdRec *r, bool indexed) {
     if (prof) prof_vtx += SDL_GetTicksNS() - prof_t2_;
     // ---- draw
     if (hud_split.idx || hud_split.inst_side) {  // in parts, each with the box at its side (fragments told where: rscale row 0)
-        float ox = vp_ox;
-        for (uint32_t s = 0, at = 0, n; hud_split.idx ? s < 3 : at < inst; at += n, s++) {
-            int side = hud_split.idx ? (int)s - 1 : hud_split.inst_side[at];
+        float ox = vp_ox, oy = vp_oy, sy0 = vp_sy, ys = renderer_origin_lower_left() ? 1.0f : -1.0f;  // (as hud_dy's)
+        int half = hud_vert ? HUD_BANDS : 1, ngroups = hud_vert ? HUD_GROUPS : 3;
+        for (uint32_t s = 0, at = 0, n; hud_split.idx ? s < (uint32_t)ngroups : at < inst; at += n, s++) {
+            int side = hud_split.idx ? (int)s - half : hud_split.inst_side[at];
             if (hud_split.idx) n = hud_split.n[s];
             else for (n = 1; at + n < inst && hud_split.inst_side[at + n] == side; n++) {}  // (instances of one side)
             if (!n) continue;
-            vp_ox = ox + side * hud_far;
+            vp_sy = sy0;
+            if (hud_vert && side == HUD_STRETCH) vp_sy = hud_stretch_sy, vp_oy = hud_stretch_oy;  // (tall: stretched)
+            else if (hud_vert) vp_oy = oy + ys * side * hud_far_y / HUD_BANDS;  // (VR's tall image: its band's way out)
+            else vp_ox = ox + side * hud_far;
             set_viewport(vp[0] * vp_sx + vp_ox, vp[1] * vp_sy + vp_oy, vp[2] * vp_sx, vp[3] * vp_sy, zn, zf);
             apply_scissor();
             if (pr->fi->uses_rscale) {
@@ -5888,7 +6023,7 @@ static void draw_(CmdRec *r, bool indexed) {
             else if (!use_index) vkCmdDraw(cb, count, n, first, base_inst + at);
             else vkCmdDrawIndexed(cb, icount, n, 0, base_vertex, base_inst + at);
         }
-        vp_ox = ox;
+        vp_ox = ox, vp_oy = oy, vp_sy = sy0;
         free(hud_split.idx);
         free(hud_split.inst_side);
     } else if (!use_index) vkCmdDraw(cb, count, inst, first, base_inst);

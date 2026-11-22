@@ -23,6 +23,9 @@ bool xr_on(void);
 int xr_display_hz(void);
 // The game's render height in VR (lines; the headset's recommended eye image's times "VR resolution"), 0 without VR
 int xr_eye_height(void);
+// In play: the game image's shape over 16:9 - the eyes' view's (narrower) - for its projection (game.c wide_frame) and
+// render targets (device.c); 0: the game's own 16:9
+float xr_shape(void);
 
 // ---- device.c, at start-up (each returns false / leaves VR off when the runtime can't)
 bool xr_setup(void);  // the loader, an instance with XR_KHR_vulkan_enable2, the headset (g_settings.vr)

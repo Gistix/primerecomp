@@ -1851,7 +1851,9 @@ static void wide_frame(Cpu *c) {
         base = *aspect;
         LOG("[wide] the game's aspect ratio: %g\n", base);
     }
-    float want = (float)(base * (widescreen_allowed() ? output_scale_shape() : 1.0));
+    extern float xr_shape(void);  // (VR, in play: the eyes' view's shape - runtime/nvn/vulkan/xr.c)
+    float vr = xr_shape();
+    float want = (float)(base * (vr > 0 ? vr : widescreen_allowed() ? output_scale_shape() : 1.0));
     if (*aspect != want) {
         static float logged;
         if (want != logged) LOG("[wide] projection aspect %g -> %g\n", *aspect, want), logged = want;

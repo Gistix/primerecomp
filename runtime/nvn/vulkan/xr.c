@@ -9,6 +9,7 @@
 bool xr_on(void) { return false; }
 int xr_display_hz(void) { return 0; }
 int xr_eye_height(void) { return 0; }
+float xr_shape(void) { return 0; }
 bool xr_setup(void) { return false; }
 VkResult xr_create_vk_instance(const VkInstanceCreateInfo *ci, VkInstance *out) { return vkCreateInstance(ci, NULL, out); }
 VkPhysicalDevice xr_vk_physical_device(VkInstance inst) { (void)inst; return VK_NULL_HANDLE; }
@@ -73,6 +74,8 @@ static struct {
     float vfov_deg;         // the eyes' vertical field of view (the widest), degrees: the game's while VR is on
     float ipd_m;            // between the eyes, metres (the runtime's views)
     uint32_t rec_w, rec_h;  // the runtime's recommended eye image size
+    float view_aspect;      // the eyes' view (both), width over height
+    _Atomic float shape;    // the game image's shape over 16:9 in play (the eyes' view's), 0 elsewhere: xr_shape
     // stereo (exec.c, each frame drawn for both eyes): the left and right game images, a swapchain each
     struct { XrSwapchain sc; int64_t fmt; uint32_t w, h, n; XrSwapchainImageVulkan2KHR *img; } eye[2];
     bool eyes_captured;
@@ -361,13 +364,20 @@ void xr_frame_begin(void) {
         XrView v[2] = {{.type = XR_TYPE_VIEW}, {.type = XR_TYPE_VIEW}};
         uint32_t n = 0;
         if (XR_SUCCEEDED(p_xrLocateViews(X.session, &li, &vs, 2, &n, v)) && n == 2) {
-            float deg = 0;
+            // the game's view covers both eyes' with its symmetric projection: half-angles the largest of the eyes'
+            // up / down and left / right (the eyes' views lean outwards: each eye's outer side is the wider)
+            float tu = 0, th = 0;
             for (int i = 0; i < 2; i++) {
-                float d = (v[i].fov.angleUp - v[i].fov.angleDown) * 57.29578f;
-                if (d > deg) deg = d;
+                tu = fmaxf(tu, fmaxf(tanf(v[i].fov.angleUp), tanf(-v[i].fov.angleDown)));
+                th = fmaxf(th, fmaxf(tanf(v[i].fov.angleRight), tanf(-v[i].fov.angleLeft)));
             }
-            if (deg > 30 && fabsf(deg - X.vfov_deg) > 0.5f) LOG("[xr] eyes' vertical field of view %.1f degrees\n", deg);
-            if (deg > 30) X.vfov_deg = deg;
+            float deg = 2 * atanf(tu) * 57.29578f;
+            if (deg > 30 && th > 0.3f) {
+                if (fabsf(deg - X.vfov_deg) > 0.5f)
+                    LOG("[xr] eyes' view %.1f x %.1f degrees (the game's: %.1f tall, %.3f wide for 1 tall)\n",
+                        2 * atanf(th) * 57.29578f, deg, deg, th / tu);
+                X.vfov_deg = deg, X.view_aspect = th / tu;
+            }
             float dx = v[1].pose.position.x - v[0].pose.position.x, dy = v[1].pose.position.y - v[0].pose.position.y,
                   dz = v[1].pose.position.z - v[0].pose.position.z, ipd = sqrtf(dx * dx + dy * dy + dz * dz);
             if (ipd > 0.03f && ipd < 0.09f) {
@@ -582,19 +592,32 @@ void xr_recenter(void) { recenter_req = true; }
 int xr_cam_sign(void) { return cam_sign ? cam_sign : 1; }
 // Draw the next frame for both eyes (exec.c vk_set_stereo): VR on, the Video tab's "VR stereo", and the head applied
 // lately (in play: not menus, the morph ball, cutscenes - on the screen, one image does)
-bool xr_stereo_wanted(void) {
-    if (!X.on || !X.running || X.throttled || !g_settings.vr_stereo || !hmx) return false;
+// In play for a while: the head applied for a third of a second running (in and out of play - a pause, the morph
+// ball - this turned stereo on and off a frame at a time, each time making the right eye's images anew). Worked out
+// once a frame (xr_frame_end); stereo and the game image's shape (xr_shape) go by it.
+static bool settled;
+static void update_settled(void) {
+    bool head = false;
     uint64_t now = SDL_GetTicksNS();
-    SDL_LockMutex(hmx);
-    bool head = last.cam && now - last.ns < 150000000ull;
-    SDL_UnlockMutex(hmx);
-    // (on once the head has been applied a third of a second running: in and out of play - a pause, the morph ball -
-    // turned it on and off a frame at a time, each time making the right eye's images anew)
+    if (X.on && X.running && !X.throttled && hmx) {
+        SDL_LockMutex(hmx);
+        head = last.cam && now - last.ns < 150000000ull;
+        SDL_UnlockMutex(hmx);
+    }
     static uint64_t since;
     if (!head) since = 0;
     else if (!since) since = now;
-    return head && now - since > 300000000ull;
+    settled = head && now - since > 300000000ull;
+    // the game image in the eyes' view's shape while in play (game.c wide_frame: its projection; device.c: its
+    // render targets) - all of it is seen, and the 2D on it (HUD, visor) is boxed into a 16:9 strip across it
+    // (exec.c ui_boxed), so the HUD is in view; elsewhere the game's 16:9, on the screen
+    float s = settled && X.view_aspect > 0.3f ? X.view_aspect / (16.0f / 9.0f) : 0;
+    if (s != X.shape) LOG("[xr] game image %s\n", s ? "in the eyes' view's shape" : "16:9");
+    X.shape = s;
 }
+float xr_shape(void) { return X.on ? X.shape : 0; }
+
+bool xr_stereo_wanted(void) { return settled && g_settings.vr_stereo; }
 float xr_vfov(void) { return X.on && X.running && X.vfov_deg > 0 ? X.vfov_deg : 0; }
 
 bool xr_head(float rot[9], float pos[3], uint32_t *id) {
@@ -674,6 +697,7 @@ void xr_note_view(const float vp[16], const float p[16]) {
 }
 
 void xr_frame_end(void) {
+    update_settled();
     // the pose of the latest update that applied the head; the image all around while that was in the last 150 ms
     static float last_tan[4] = {-1, 1, 1, -1};
     if (fv.seen) memcpy(last_tan, fv.tan, sizeof last_tan);
