@@ -25,6 +25,12 @@ files (as for players), given the generator and the compiler (`make gen-helper`,
 
 Run from a shell that has `C:\msys64\ucrt64\bin` on PATH (SDL3, FFmpeg, Vulkan, shaderc DLLs).
 
+VR headsets (OpenXR, `runtime/nvn/vulkan/xr.c`) are built in when the OpenXR SDK is installed
+(`pacman -S mingw-w64-ucrt-x86_64-openxr-sdk`, part of the setup script); `make VR=0` builds without. The loader DLL
+is opened at run time, so the program runs without it too. To try it: Video tab > VR headset, then start again with
+SteamVR, Meta Quest Link or Virtual Desktop as the OpenXR runtime. `LARECOMP_NO_VR=1` turns it off for one run; the
+log's `[xr]` lines say what the runtime and headset did.
+
 ## Package
     make gen-helper     # the game code generator without Python (build/helper/primegen)
     tools/fetch_zig.sh  # the compiler the start screen builds the game code with (build/zig)

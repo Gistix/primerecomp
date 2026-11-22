@@ -1496,6 +1496,18 @@ static void dlss_note_camera(uint32_t vcbuf_mask, float zn) {
     dl.zworld = zn;
 }
 
+// VR (xr.c): the same camera block, for which head pose the frame was drawn with (xr_note_view takes the frame's first)
+static void vr_note_camera(uint32_t vcbuf_mask) {
+    extern bool xr_on(void);
+    extern void xr_note_view(const float vp[16], const float p[16]);
+    if (!xr_on() || !((vcbuf_mask >> 3) & 1)) return;
+    Range u = st.ubuf[0][0];
+    if (!u.addr || u.size < 544) return;
+    const float *f = (const float *)(uintptr_t)u.addr, *p = f + 88;
+    if (!(p[0] > 0.1f && p[5] > 0.1f && p[11] == -1.0f && p[15] == 0.0f) || !(fabsf(f[5]) > 0.1f)) return;
+    xr_note_view(f, p);
+}
+
 static VkFormat raw_format(const TexBackend *b);
 // Before a draw's pass begins: the first camera-attached draw (depth range under 0.039, not the gun's) into the image
 // that gets presented, after the world: the image as it is, copied into dl.hud (the HUD mask, dlss_mv)
@@ -5603,7 +5615,10 @@ static void draw_(CmdRec *r, bool indexed) {
     // ---- textures first (their scales feed the widescreen decision and the rscale table), then the viewport
     float *vp = st.viewport[0];
     float zn = st.depth_range[0][0], zf = st.depth_range[0][1];
-    if (dw && zf == 1.0f && zn > 0.03f && zn < 0.05f) dlss_note_camera(pr->vi->cbuf_mask, zn);  // (a world draw: its camera)
+    if (dw && zf == 1.0f && zn > 0.03f && zn < 0.05f) {  // (a world draw: its camera)
+        dlss_note_camera(pr->vi->cbuf_mask, zn);
+        vr_note_camera(pr->vi->cbuf_mask);
+    }
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
     // fragment textures are bound before deciding the viewport (tex_sc / tex_wh), rscale depends on the decision:
     // build the vertex set now and the fragment set after the decision (stage_set fills tex_sc for stage 1).

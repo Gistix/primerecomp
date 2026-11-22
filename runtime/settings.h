@@ -51,6 +51,12 @@ enum { SUIT_COLOR_RED = 0, SUIT_COLOR_BLUE = 10, SUIT_COLOR_WHITE = 15 };
 #define DEADZONE_MAX 0.30f  // (a stick's dead zone, 0..this: Controls tab)
 #define STRAIGHT_MAX 20     // (the left stick's straight-ahead snap, degrees: Controls tab)
 #define RUMBLE_STRENGTH_MAX 2.0f  // (rumble strength, 0..this = 200%: Audio tab)
+#define VR_SCREEN_DIST_MIN 1.0f    // (VR: the screen's distance and width, metres: Video tab)
+#define VR_SCREEN_DIST_MAX 10.0f
+#define VR_SCREEN_WIDTH_MIN 1.0f
+#define VR_SCREEN_WIDTH_MAX 12.0f
+#define VR_SCALE_MIN 0.25f         // (VR: world scale, game units per metre: Video tab)
+#define VR_SCALE_MAX 4.0f
 #define MOUSE_SENS_MIN 0.1f  // (mouse aim sensitivity range: Controls tab)
 #define MOUSE_SENS_MAX 10.0f
 // System language served to the game (runtime/services/am.c GetDesiredLanguage, services/hid_set.c GetLanguageCode):
@@ -90,6 +96,11 @@ typedef struct {
                          // frame)
                          // (runtime/hle/game.c); LARECOMP_FPS overrides it
     bool vsync;          // no tearing (runtime/nvn/vulkan/device.c present_mode)
+    bool vr;             // a VR headset through OpenXR when one is found (runtime/nvn/vulkan/xr.c; Windows builds with
+                         // the OpenXR SDK): read at start-up only - a change applies when the program starts again
+    float vr_screen_distance;  // VR: the screen the game is shown on, this far ahead (metres; xr.c)
+    float vr_screen_width;     // VR: ... and this wide (metres)
+    float vr_world_scale;      // VR: game units per metre the head moves (1: the game's units as metres)
     bool preload_shaders;  // the start screen builds every shader recorded so far before PLAY (runtime/nvn/vulkan/exec.c
                            // vk_preload_start): nothing seen before pops in when it's first drawn in a session
     bool texture_mods;   // the game's textures replaced by the files in mods/ (runtime/nvn/vulkan/texmods.c), from start
@@ -109,6 +120,9 @@ typedef struct {
     int weapon_fov;      // the arm cannon's, drawn as at this field of view whatever the view's (FOV_MIN..FOV_MAX;
                          // 55: as the game draws it; = fov: as before 2026-11, wider with the view): game.c, exec.c
     bool skippable_cutscenes;  // every cutscene can be skipped, seen before or not (runtime/hle/game.c)
+    bool head_bob;       // Comfort: the view bobs as Samus walks, sways when she stands, dips as she lands (off: still;
+                         // runtime/hle/game.c comfort_frame) - in VR and out
+    bool camera_shake;   // Comfort: explosions, big enemies and landings shake the view (game.c rt_shake_update)
     int suit_style;      // SUIT_*: Samus' suit's colors (runtime/nvn/vulkan/suitmods.c)
     int suit_helmet, suit_armor, suit_body;  // SUIT_CUSTOM: g_suit_colors indices for the helmet, the armor (chest,
                                               // shoulders) and the rest of the suit

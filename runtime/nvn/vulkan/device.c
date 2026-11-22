@@ -20,6 +20,7 @@
 #include "../dlss.h"
 #include "../fsr.h"
 #include "../renderer.h"
+#include "xr.h"
 
 VkG g_vk;
 static SDL_Window *window;
@@ -103,13 +104,15 @@ static void create_instance(void) {
     VkInstanceCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .flags = flags, .pApplicationInfo = &app,
                                .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext,
                                .enabledLayerCount = validate ? 1 : 0, .ppEnabledLayerNames = layers};
-    VkResult r = vkCreateInstance(&ci, NULL, &g_vk.inst);
+    // VR (xr.c): the OpenXR runtime makes the instance, adding the extensions it needs to these
+    xr_setup();
+    VkResult r = xr_create_vk_instance(&ci, &g_vk.inst);
     if (r != VK_SUCCESS && validate) {
         LOG("[vk] validation layer unavailable (%d); continuing without\n", r);
         ci.enabledLayerCount = 0;
         ci.enabledExtensionCount--;
         validate = false;
-        r = vkCreateInstance(&ci, NULL, &g_vk.inst);
+        r = xr_create_vk_instance(&ci, &g_vk.inst);
     }
     if (r != VK_SUCCESS) FATAL("vkCreateInstance: %d (is a Vulkan 1.3 driver installed?)\n", r);
     if (validate) {
@@ -138,6 +141,7 @@ static void pick_device(void) {
     VkPhysicalDevice *pd = calloc(n, sizeof *pd);
     vkEnumeratePhysicalDevices(g_vk.inst, &n, pd);
     int want = getenv("LARECOMP_GPU") ? atoi(getenv("LARECOMP_GPU")) : -1, best = -1, best_score = -1;
+    VkPhysicalDevice xr_gpu = xr_vk_physical_device(g_vk.inst);  // (VR: the GPU the headset is on, whatever else)
     for (uint32_t i = 0; i < n; i++) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(pd[i], &p);
@@ -146,10 +150,12 @@ static void pick_device(void) {
         if (p.apiVersion < VK_API_VERSION_1_3) continue;
         int score = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 3 : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2 : 1;
         if ((int)i == want) score = 100;
+        if (xr_gpu && pd[i] == xr_gpu) score = 1000;
         if (score > best_score) { best_score = score; best = (int)i; }
     }
     if (best < 0) FATAL("no Vulkan 1.3 device\n");
     g_vk.phys = pd[best];
+    if (xr_on() && g_vk.phys != xr_gpu) xr_off("the headset's GPU isn't one the game can use");
     free(pd);
     vkGetPhysicalDeviceProperties(g_vk.phys, &g_vk.props);
     {   // (Mesa's llvmpipe: 2 GB, less than the guest heap the renderer imports in one piece - exec.c gmem_info)
@@ -388,8 +394,9 @@ static void create_device(void) {
                                   .queueCount = 1, .pQueuePriorities = &prio};
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f, .queueCreateInfoCount = 1,
                              .pQueueCreateInfos = &qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
-    VK_CHECK(vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.dev));
+    VK_CHECK(xr_create_vk_device(g_vk.phys, &di, &g_vk.dev));  // (VR: through the OpenXR runtime, xr.c)
     vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 0, &g_vk.queue);
+    xr_start_session(g_vk.inst, g_vk.phys, g_vk.dev, g_vk.qfam);
     if (dlss_exts) dlss_init(g_vk.inst, g_vk.phys, g_vk.dev, (void *)vkGetInstanceProcAddr, (void *)vkGetDeviceProcAddr);
     if (fsr_feat) fsr_init(g_vk.inst, g_vk.phys, g_vk.dev, (void *)vkGetDeviceProcAddr);
 
@@ -490,6 +497,9 @@ static VkPresentModeKHR present_mode(void) {
     if (e) want = !strcmp(e, "mailbox") ? VK_PRESENT_MODE_MAILBOX_KHR : !strcmp(e, "immediate") ? VK_PRESENT_MODE_IMMEDIATE_KHR
                                                                          : VK_PRESENT_MODE_FIFO_KHR;
     else if (!g_settings.vsync) want = VK_PRESENT_MODE_IMMEDIATE_KHR, then = VK_PRESENT_MODE_MAILBOX_KHR;
+    // VR (xr.c): the headset paces the frames and the window is only its mirror, so it must never hold them to the
+    // monitor's refresh (FIFO: a 60 Hz monitor would make a 90 Hz headset 60)
+    if (!e && xr_on() && then == VK_PRESENT_MODE_FIFO_KHR) then = VK_PRESENT_MODE_IMMEDIATE_KHR;
     uint32_t n = 0;
     vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &n, NULL);
     VkPresentModeKHR m[16];
@@ -720,6 +730,9 @@ static void save_window_image(VkCommandBuffer cb, VkSpan *out) {
     image_barrier(cb, g_vk.sc_images[cur_frame.image], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 }
 
+void vk_game_rect(float r[4]);
+static bool g_presenting_game;  // vk_frame_end called by backend_present (the game's frame), not the start screen
+
 // End rendering into the window image and present it. shot_path: also save the window image as PNG.
 void vk_frame_end(const char *shot_path) {
     if (!cur_frame.ok) return;
@@ -745,6 +758,17 @@ void vk_frame_end(const char *shot_path) {
         }
     } else if (shot_path) {
         save_window_image(cb, &shot);
+    }
+    if (!hdr) {  // VR (xr.c): the game's part of the window image - with the menu over it - to the headset's screen
+        float r[4] = {0, 0, 1, 1};  // (the start screen: the whole window)
+        if (g_presenting_game) vk_game_rect(r);
+        int W = (int)g_vk.sc_extent.width, H = (int)g_vk.sc_extent.height;
+        int x = (int)lroundf(r[0] * W), y = (int)lroundf(r[1] * H), w = (int)lroundf(r[2] * W), h = (int)lroundf(r[3] * H);
+        if (x < 0) w += x, x = 0;
+        if (y < 0) h += y, y = 0;
+        if (x + w > W) w = W - x;
+        if (y + h > H) h = H - y;
+        xr_capture(cb, g_vk.sc_images[cur_frame.image], g_vk.sc_format, x, y, w, h);
     }
     image_barrier(cb, g_vk.sc_images[cur_frame.image], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     uint32_t img = cur_frame.image;
@@ -838,10 +862,11 @@ void backend_present(NvnTexture *t) {
     // the frame the Video tab's HDR row changes
     static bool targets_hdr;
     g_frame_wants_hdr = targets_hdr;
+    xr_frame_begin();  // (VR: waits for the headset's next frame - its pacing - before this one is drawn)
     bool have = vk_frame_begin(black);
     g_frame_wants_hdr = false;  // (asked for this frame only: the start screen's stay SDR)
     extern void renderer_set_hdr(bool on);  // (textures.c: the game's full-size sRGB targets as RGBA16F from now on)
-    targets_hdr = g_settings.hdr && g_vk.colorspace_ext && g_vk.hdr_offered;
+    targets_hdr = g_settings.hdr && g_vk.colorspace_ext && g_vk.hdr_offered && !xr_on();  // (VR: SDR, as the headset takes)
     renderer_set_hdr(targets_hdr);
     uint64_t nd = SDL_GetTicksNS() - t0;
     if (nd > 30000000) {
@@ -899,12 +924,15 @@ void backend_present(NvnTexture *t) {
             requested[0] = 0;
         }
         const char *shot_path = getenv("LARECOMP_SHOT_PATH");  // (parallel test runs: each its own, tools/shot.sh)
+        g_presenting_game = true;
         vk_frame_end(shot ? (shot_path ? shot_path : "build/window.png") : requested[0] ? requested : NULL);
+        g_presenting_game = false;
         vk_astc_gpu_check_run();  // (LARECOMP_ASTC_CHECK)
         if (shot && getenv("LARECOMP_EXIT_AFTER_SHOT")) { fflush(stderr); _exit(0); }
     } else {
         renderer_submit();
     }
+    xr_frame_end();  // (after the submission with the headset's copy in it: vk_frame_end)
     extern void vk_prof_frame(uint64_t frame, uint64_t present_ns);
     vk_prof_frame(total_frames, SDL_GetTicksNS() - t0);
     frames++;

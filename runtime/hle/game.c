@@ -24,18 +24,28 @@ const char *game_level_name(void) { return "-"; }
 // screens - a Steam Deck OLED's - and 180 Hz ones). 30: a frame every 1/30 s, two ticks each
 // (slower machines: a steady 30 at full speed). (No uncapped rate since 2026-10-27, at the user's request: the game
 // runs a tick every frame however short the frame was, so one needed a tick of each frame's own time.)
+// VR (runtime/nvn/vulkan/xr.c): a headset at 60..120 Hz sets the rate - the game's step is 1 / its refresh rate (a
+// Quest's 72 or 80 too: every place the step is built takes rt_sim_step_bits) - and paces the frames itself
+// (game_pace_present). Another rate with the headset's waits on top judders: a 60 fps game on a 72 Hz headset waited
+// for both, ~50 fps with the game's 30 fps mode coming and going. Faster ones (144): the setting's rate, paced here.
+extern int xr_display_hz(void);
+static bool vr_paces(void) {
+    int hz = xr_display_hz();
+    return hz >= 60 && hz <= 120;
+}
+
 int game_frame_rate(void) {
     static int env = -2;
     if (env == -2) {
         int e = getenv("LARECOMP_FPS") ? atoi(getenv("LARECOMP_FPS")) : -1;
         env = e == 30 || e == 60 || e == 90 || e == 120 ? e : -1;
     }
-    return env > 0 ? env : g_settings.frame_rate;
+    return env > 0 ? env : vr_paces() ? xr_display_hz() : g_settings.frame_rate;
 }
 
 uint32_t rt_sim_step_bits(int negative) {
     int fps = game_frame_rate();
-    float step = 1.0f / (fps == 90 || fps == 120 ? fps : 60);
+    float step = 1.0f / (fps > 60 ? fps : 60);  // (30: two 1/60 steps a frame)
     uint32_t b;
     memcpy(&b, &step, 4);
     return negative ? b | 0x80000000u : b;
@@ -51,7 +61,7 @@ void rt_air_drag(Cpu *c) {
     memcpy(&a, &ab, 4);
     memcpy(&b, &bb, 4);
     r = a * b;
-    if (sb != 0x3c888889u) {  // (not 1/60: the 90 or 120 fps step)
+    if (sb != 0x3c888889u) {  // (not 1/60: a faster rate's step - 90, 120, a VR headset's)
         float step;
         memcpy(&step, &sb, 4);
         r *= step * 60.0f;
@@ -184,7 +194,7 @@ void game_pace_present(int interval) {
     static uint64_t next;
     uint64_t period = (uint64_t)(1e9 * (interval > 0 ? interval : 1) / fps), now = plat_now_ns();
     if (!next || now > next + 4 * period) next = now;
-    else plat_sleep_until_ns(next);
+    else if (!vr_paces() || fps != xr_display_hz()) plat_sleep_until_ns(next);  // (VR: xrWaitFrame waits instead)
     g_present_ns = plat_now_ns();
     // (idle, not work: the frame pacing's busy time - runtime/nvn/vulkan/exec.c vk_pace_frame - leaves it out)
     extern __thread uint64_t g_blocked_ns;
@@ -216,6 +226,9 @@ static uint64_t g_player_seen;  // the frame the player last updated (rt_player_
 int rt_fov(void) {  // (LARECOMP_FOV: test override)
     static int env = -2;
     if (env == -2) env = getenv("LARECOMP_FOV") ? atoi(getenv("LARECOMP_FOV")) : -1;
+    extern float xr_vfov(void);  // (VR: the headset's - the image fills the eyes' view, things at their real size)
+    float vr = xr_vfov();
+    if (env <= 0 && vr > 0) return (int)lroundf(vr < 150 ? vr : 150);
     int f = env > 0 ? env : g_settings.fov;
     return f < FOV_MIN ? FOV_MIN : f > FOV_MAX ? FOV_MAX : f;
 }
@@ -344,6 +357,59 @@ static void rt_steam_think(Cpu *c) {
 
 static GuestFn g_fp_think;
 static void rt_fp_think(Cpu *c);
+
+// ---- Comfort (Gameplay tab; for VR above all, in and out of it)
+// "Camera shake" off: the shaker manager's own switch, CCameraShakerManager::EnableCameraShaking (a flag at +0x2484;
+// turning it off also drops the shakes running), set off before its update while the option is off - and back on
+// when the option is, if it was this that turned it off (the game turns it off itself at times: left as it is).
+static GuestFn g_shake_update;
+static void rt_shake_update(Cpu *c) {
+    static uint64_t turned_off;  // (the manager this turned off)
+    uint64_t mgr = c->x[0];
+    bool want = g_settings.camera_shake;
+    bool on = LD8(mgr + 0x2484) != 0;
+    if ((!want && on) || (want && !on && turned_off == mgr)) {
+        Cpu *saved = malloc(sizeof *saved);
+        *saved = *c;
+        c->x[0] = mgr;
+        c->x[1] = want;
+        guest_call(c, guest_sym("_ZN20CCameraShakerManager19EnableCameraShakingEb"));
+        *c = *saved;
+        free(saved);
+        turned_off = want ? 0 : mgr;
+        LOG("[comfort] camera shake %s\n", want ? "on" : "off");
+    }
+    g_shake_update(c);
+}
+
+// "Head bob" off: the camera bob's tunings that move the view - how far it bobs (CPlayerCameraBobMP1's
+// kCameraBobExtentX / Y), the idle sway (kViewWanderRadius, kViewWanderRollVariation), a hard landing's dip
+// (kHeavyLandingViewDip) and the helmet's bob (kHelmetBobMagnitude) - 0 while it's off, the game's own (as its tweaks
+// loaded them) when it's on again. The arm cannon's own sway stays. Each gameplay frame (rt_debug_autosave).
+static void comfort_frame(void) {
+    static const char *const names[] = {
+        "_ZN19CPlayerCameraBobMP117kCameraBobExtentXE", "_ZN19CPlayerCameraBobMP117kCameraBobExtentYE",
+        "_ZN19CPlayerCameraBobMP117kViewWanderRadiusE", "_ZN19CPlayerCameraBobMP124kViewWanderRollVariationE",
+        "_ZN19CPlayerCameraBobMP120kHeavyLandingViewDipE", "_ZN19CPlayerCameraBobMP119kHelmetBobMagnitudeE"};
+    enum { N = sizeof names / sizeof *names };
+    static float game[N];  // (the game's values, once read: 0 = not yet)
+    static bool zeroed;
+    bool off = !g_settings.head_bob;
+    if (!off && !zeroed) {  // (the game's own in place: keep a copy of them as its tweaks set them)
+        for (int i = 0; i < N; i++) {
+            float v = *(float *)(uintptr_t)guest_sym(names[i]);
+            if (v != 0) game[i] = v;
+        }
+        return;
+    }
+    for (int i = 0; i < N; i++) {
+        float *v = (float *)(uintptr_t)guest_sym(names[i]);
+        if (off && *v != 0) game[i] = *v;  // (off from the start, or the tweaks loaded again: the game's, kept first)
+        *v = off ? 0.0f : game[i];
+    }
+    if (zeroed != off) LOG("[comfort] head bob %s\n", off ? "off" : "on");
+    zeroed = off;
+}
 
 // Shots in water at 90 and 120 fps. CGameProjectileMP1::UpdateProjectileMovement(dt) moves a projectile - Samus' beams
 // and missiles, enemies' shots - by advancing its weapon (CProjectileWeapon::Update, a virtual call: 0x7001018ad8) by
@@ -827,6 +893,12 @@ void game_hooks_init(void) {  // (each boot, after dispatch_init)
     static bool hooked;
     g_frame_begin = dispatch_lookup(a);
     if (g_frame_begin && !hooked) hle_override(a, rt_frame_begin, "CGameIOWinMP1::FrameBegin"), hooked = true;
+    {   // Gameplay tab "Camera shake" (rt_shake_update)
+        uint64_t sh = guest_sym("_ZN20CCameraShakerManager6UpdateER13CStateManagerf");
+        static bool shooked;
+        g_shake_update = dispatch_lookup(sh);
+        if (g_shake_update && !shooked) hle_override(sh, rt_shake_update, "CCameraShakerManager::Update"), shooked = true;
+    }
     uint64_t t = guest_sym("_ZN21CFirstPersonCameraMP15ThinkEfR13CStateManager");
     static bool thooked;
     g_fp_think = dispatch_lookup(t);
@@ -1108,7 +1180,10 @@ static void gamecube_frame(Cpu *c) {
     settings_save();
 }
 
+static void vr_head_restore(Cpu *c);
 void rt_debug_autosave(Cpu *c) {
+    vr_head_restore(c);  // (VR: the camera as the game left it, before this frame's update reads it)
+    comfort_frame();
     debug_stall();
     gamecube_frame(c);
     debug_teleport(c);
@@ -1251,6 +1326,8 @@ void rt_player_frame(Cpu *c) {
 // bob - DoPostCameraStuff, after the cameras' updates - the camera only followed a frame later, a frame behind a stick's
 // turn, which the player's own update applies before the cameras. Its player found as Think finds it: the object with
 // the camera's watched id (+0x1e8), cast to CPlayerMP1. Elsewhere (the morph ball, lock-on) rt_player_frame as before.
+static void vr_head_apply(Cpu *c, uint64_t cam, uint64_t sm);
+static void vr_head_restore_cam(Cpu *c, uint64_t cam);
 static void rt_fp_think(Cpu *c) {
     static int after = -1;  // (debug) LARECOMP_MOUSE_AFTER_CAMERA=1: after the cameras, as before
     if (after < 0) after = getenv("LARECOMP_MOUSE_AFTER_CAMERA") != NULL;
@@ -1278,7 +1355,92 @@ static void rt_fp_think(Cpu *c) {
         *c = *saved;
         free(saved);
     }
+    // VR: a second update in one frame (two simulation steps) starts from the camera as the game had it, and gets the
+    // head again after - else that frame was drawn without it (a frame matching no pose: xr.c)
+    vr_head_restore_cam(c, cam);
     g_fp_think(c);
+    vr_head_apply(c, cam, sm);
+}
+
+// ---- VR head tracking (runtime/nvn/vulkan/xr.c): the head turns and moves the first-person camera, not the aim.
+// After the camera's update (CFirstPersonCameraMP1::Think, which makes it from Samus' facing and her look up and down
+// every frame) its transform is turned by the head's rotation in its own axes and moved by the head's movement (about
+// the world's up - y - only: looking down and stepping forward goes forward, not into the floor), through
+// CActorMP1::SetTransform - so
+// the world is drawn, and culled, from where the player looks. At the next frame's start (CStateManager::BeginFrame:
+// rt_debug_autosave) the camera is put back as Think left it, before Samus' update aims and shoots: the aim stays the
+// stick's, gyro's or mouse's. Which pose went into which drawn frame: xr.c (xr_note_view).
+static uint64_t g_vr_cam;
+static float g_vr_saved[12];
+static float *vr_cam_transform(Cpu *c, uint64_t cam) {  // (CActorMP1::GetTransform: a pointer to the actor's own)
+    Cpu *saved = malloc(sizeof *saved);
+    *saved = *c;
+    c->x[0] = cam;
+    guest_call(c, guest_sym("_ZNK9CActorMP112GetTransformEv"));
+    float *m = (float *)(uintptr_t)c->x[0];
+    *c = *saved;
+    free(saved);
+    return GUEST_PTR_OK((uint64_t)(uintptr_t)m) ? m : NULL;
+}
+static void vr_cam_set(Cpu *c, uint64_t cam, const float m[12]) {
+    static float *xf;
+    if (!xf) xf = hle_alloc(64);
+    memcpy(xf, m, 48);
+    Cpu *saved = malloc(sizeof *saved);
+    *saved = *c;
+    c->x[0] = cam;
+    c->x[1] = (uint64_t)(uintptr_t)xf;
+    guest_call(c, guest_sym("_ZN9CActorMP112SetTransformERK12CTransform4f"));
+    *c = *saved;
+    free(saved);
+}
+
+static void vr_head_apply(Cpu *c, uint64_t cam, uint64_t sm) {
+    extern bool xr_on(void);
+    extern bool xr_head(float rot[9], float pos[3], uint32_t *id);
+    extern void xr_head_used(uint32_t id, const float cam[12]);
+    if (!xr_on() || first_person_camera(c, sm) != cam) return;
+    float h[9], hp[3];
+    uint32_t id;
+    if (!xr_head(h, hp, &id)) return;
+    float *m = vr_cam_transform(c, cam);
+    if (!m) return;
+    memcpy(g_vr_saved, m, 48);
+    float n[12];
+    for (int i = 0; i < 3; i++) {  // the rotation: the camera's axes (columns) turned by the head's, in the camera's
+        for (int j = 0; j < 3; j++) n[i * 4 + j] = m[i * 4] * h[j] + m[i * 4 + 1] * h[3 + j] + m[i * 4 + 2] * h[6 + j];
+    }
+    // the movement (OpenXR's axes: x right, y up, z back) along the camera's facing about the world's up (y): ahead
+    // is its view axis (z, either way: xr_cam_sign) flattened, right that turned a quarter
+    extern int xr_cam_sign(void);
+    float sg = (float)xr_cam_sign(), fx = -sg * m[2], fz = -sg * m[10], fl = sqrtf(fx * fx + fz * fz);
+    if (fl > 1e-4f) fx /= fl, fz /= fl;
+    else fx = 0, fz = -1;
+    float rx = -fz, rz = fx;  // (ahead x up)
+    // (not drawn yet: the view's position isn't the camera object's - that one stays where the room was entered - so
+    // leaning needs the place the view's position comes from; LARECOMP_VR_LEAN=1 tries it here)
+    static int lean = -1;
+    if (lean < 0) lean = getenv("LARECOMP_VR_LEAN") != NULL;
+    if (!lean) hp[0] = hp[1] = hp[2] = 0;
+    n[3] = m[3] + rx * hp[0] - fx * hp[2];
+    n[7] = m[7] + hp[1];
+    n[11] = m[11] + rz * hp[0] - fz * hp[2];
+    vr_cam_set(c, cam, n);
+    g_vr_cam = cam;
+    xr_head_used(id, n);
+}
+
+static void vr_head_restore_cam(Cpu *c, uint64_t cam) {  // (before Think: this camera as Think left it last)
+    if (g_vr_cam != cam) return;
+    g_vr_cam = 0;
+    vr_cam_set(c, cam, g_vr_saved);
+}
+
+static void vr_head_restore(Cpu *c) {
+    if (!g_vr_cam) return;
+    uint64_t cam = g_vr_cam;
+    g_vr_cam = 0;
+    if (first_person_camera(c, c->x[0]) == cam) vr_cam_set(c, cam, g_vr_saved);  // (else gone or not current)
 }
 
 // Samus can be turned and her view tilted directly (mouse aim, flick stick): on foot (+0x4d4, the morph ball state, 0 =

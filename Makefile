@@ -144,6 +144,13 @@ else
 EXE      := $(B)/primerecomp.exe
 DEPINC   := $(if $(DEPS),-I$(DEPS)/include)
 OSFLAGS  := -D_FILE_OFFSET_BITS=64 -D_POSIX_THREAD_SAFE_FUNCTIONS -D_CRT_RAND_S -DWIN32_LEAN_AND_MEAN -DNOMINMAX
+# VR headsets (runtime/nvn/vulkan/xr.c) when the OpenXR SDK's headers are there (MSYS2: mingw-w64-ucrt-x86_64-openxr-sdk);
+# its loader is opened at run time, not linked. VR=0: a build without.
+VR       ?= $(shell printf '\#include <openxr/openxr.h>\n' | $(CC) $(DEPINC) -E -x c - >/dev/null 2>&1 && echo 1 || echo 0)
+XR_DLL   := $(wildcard $(dir $(shell command -v clang 2>/dev/null))*openxr_loader*.dll)  # (make dist)
+ifeq ($(VR),1)
+OSFLAGS  += -DPRIME_VR
+endif
 GENARCH  ?= -march=x86-64-v3  # AVX2 + FMA for the lifted FP/SIMD code (simd.h); x86-64-v2 at setup without them
 GENFLAGS += -D_FILE_OFFSET_BITS=64 $(GENARCH)
 LDFLAGS  := -fuse-ld=lld -Wl,--stack,16777216 $(if $(DEPS),-L$(DEPS)/lib) -lSDL3 -lavformat -lavcodec -lavutil -lswscale \
@@ -322,6 +329,7 @@ dist:
 	cp build/ffx/amd_fidelityfx_loader_vk.dll build/ffx/amd_fidelityfx_upscaler_vk.dll build/ffx/AMD-FSR-LICENSE.md "$(DIST)/"  # (FSR 3 / 4)
 	PATH="$(CURDIR)/build/deps-win/bin:$$PATH" ldd $(WIN_B)/primerecomp.exe | awk '(/ucrt64/ || /deps-win/) && !/vulkan-1/ {print $$3}' | sort -u | \
 	    xargs -I{} cp -u {} "$(DIST)/"
+	$(if $(XR_DLL),cp $(XR_DLL) "$(DIST)/")  # (VR: not linked - xr.c opens it - so ldd doesn't list it)
 	! ls "$(DIST)" | grep -iE 'x264|x265|xvid|postproc'  # (no GPL codec libraries in the release)
 	cd build/dist && if command -v zip >/dev/null; then zip -qr "PrimeRecomp-$(VERSION)-windows.zip" "PrimeRecomp"; \
 	    else /c/Windows/System32/tar.exe -a -cf "PrimeRecomp-$(VERSION)-windows.zip" "PrimeRecomp"; fi

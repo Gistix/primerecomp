@@ -564,6 +564,10 @@ void input_handle_event(const SDL_Event *e) {
     case SDL_EVENT_KEY_DOWN: case SDL_EVENT_KEY_UP:
         if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F9 && !e->key.repeat) g_debug_frame_request = 1;
         if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F8 && !e->key.repeat) g_pos_save_request = 1;
+        if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F7 && !e->key.repeat) {
+            extern void xr_recenter(void);  // (VR: straight ahead is where the head faces now - runtime/nvn/vulkan/xr.c)
+            xr_recenter();
+        }
         if (e->type == SDL_EVENT_KEY_DOWN && !e->key.repeat && !(e->key.scancode >= SDL_SCANCODE_F1 && e->key.scancode <= SDL_SCANCODE_F12))
             glyphs_note_device(GLYPH_DEV_KEYS);  // (the button icons, on Auto: the runtime's own F keys don't count)
         if (e->key.scancode < SDL_SCANCODE_COUNT) {

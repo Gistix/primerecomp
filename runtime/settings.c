@@ -35,6 +35,11 @@ Settings g_settings = {
     .show_fps = false,
     .frame_rate = 60,
     .vsync = true,
+    .vr_screen_distance = 2.5f,
+    .vr_screen_width = 3.0f,
+    .vr_world_scale = 1.0f,
+    .head_bob = true,
+    .camera_shake = true,
     .hint_on_l3 = true,
     .crosshair = true,
     .texture_mods = true,
@@ -227,6 +232,17 @@ void settings_load(void) {
             g_settings.frame_rate = r == 120 || r == 90 || r == 30 ? r : r == 0 ? 120 : 60;  // (0: Uncapped, gone since 2026-10-27)
         }
         else if (!strcmp(key, "vsync")) g_settings.vsync = atoi(val) != 0;
+        else if (!strcmp(key, "vr")) g_settings.vr = atoi(val) != 0;
+        else if (!strcmp(key, "vr_screen_distance")) {
+            float v = (float)atof(val);
+            if (v >= VR_SCREEN_DIST_MIN && v <= VR_SCREEN_DIST_MAX) g_settings.vr_screen_distance = v;
+        } else if (!strcmp(key, "vr_screen_width")) {
+            float v = (float)atof(val);
+            if (v >= VR_SCREEN_WIDTH_MIN && v <= VR_SCREEN_WIDTH_MAX) g_settings.vr_screen_width = v;
+        } else if (!strcmp(key, "vr_world_scale")) {
+            float v = (float)atof(val);
+            if (v >= VR_SCALE_MIN && v <= VR_SCALE_MAX) g_settings.vr_world_scale = v;
+        }
         else if (!strcmp(key, "preload_shaders")) g_settings.preload_shaders = atoi(val) != 0;
         else if (!strcmp(key, "texture_mods")) g_settings.texture_mods = atoi(val) != 0;
         else if (!strcmp(key, "dump_textures")) g_settings.dump_textures = atoi(val) != 0;
@@ -242,6 +258,8 @@ void settings_load(void) {
         else if (!strcmp(key, "weapon_fov"))
             g_settings.weapon_fov = atoi(val) < FOV_MIN ? FOV_MIN : atoi(val) > FOV_MAX ? FOV_MAX : atoi(val);
         else if (!strcmp(key, "skippable_cutscenes")) g_settings.skippable_cutscenes = atoi(val) != 0;
+        else if (!strcmp(key, "head_bob")) g_settings.head_bob = atoi(val) != 0;
+        else if (!strcmp(key, "camera_shake")) g_settings.camera_shake = atoi(val) != 0;
         else if (!strcmp(key, "crosshair")) g_settings.crosshair = atoi(val) != 0;
         else if (!strcmp(key, "hint_on_l3")) g_settings.hint_on_l3 = atoi(val) != 0;
         else if (!strcmp(key, "hint_seconds")) g_settings.hint_seconds = g_hint_waits[settings_hint_wait_index(atoi(val))];
@@ -382,6 +400,10 @@ static void write_settings(void *o) {
     put(o, "show_fps = %d\n", g_settings.show_fps);
     put(o, "frame_rate = %d\n", g_settings.frame_rate);
     put(o, "vsync = %d\n", g_settings.vsync);
+    put(o, "vr = %d\n", g_settings.vr);
+    put(o, "vr_screen_distance = %.2f\n", g_settings.vr_screen_distance);
+    put(o, "vr_screen_width = %.2f\n", g_settings.vr_screen_width);
+    put(o, "vr_world_scale = %.2f\n", g_settings.vr_world_scale);
     put(o, "preload_shaders = %d\n", g_settings.preload_shaders);
     put(o, "texture_mods = %d\ndump_textures = %d\n", g_settings.texture_mods, g_settings.dump_textures);
     if (g_settings.mods_order[0]) put(o, "mods_order = %s\n", g_settings.mods_order);
@@ -391,6 +413,7 @@ static void write_settings(void *o) {
         g_settings.hdr, g_settings.hdr_peak, g_settings.hdr_paper, g_settings.hdr_wide, g_settings.hdr_hud);
     put(o, "fov = %d\nweapon_fov = %d\nskippable_cutscenes = %d\ngyro = %d\n", g_settings.fov, g_settings.weapon_fov,
             g_settings.skippable_cutscenes, g_settings.gyro);
+    put(o, "head_bob = %d\ncamera_shake = %d\n", g_settings.head_bob, g_settings.camera_shake);
     put(o, "crosshair = %d\n", g_settings.crosshair);
     put(o, "discord_status = %d\n", g_settings.discord);
     put(o, "mouse_aim = %d\nmouse_sens = %.2f\nmouse_invert = %d\n", g_settings.mouse_aim, g_settings.mouse_sens,

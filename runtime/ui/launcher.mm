@@ -46,6 +46,9 @@ SDL_Window *ui_window(void);
 bool vk_frame_begin(const float clear[4]);
 void vk_frame_end(const char *shot_path);
 void *vk_frame_cmd(void);
+void xr_frame_begin(void);  // (VR, runtime/nvn/vulkan/xr.c: the start screen on the headset's screen too)
+void xr_frame_end(void);
+bool xr_on(void);
 bool vk_imgui_backend_init(void);
 void vk_imgui_backend_shutdown(void);
 uint64_t vk_imgui_texture_rgba(const void *rgba, int w, int h);
@@ -1371,10 +1374,11 @@ extern "C" void launcher_run(const char *root) {
             const SDL_DisplayMode *dm = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(win));
             uint64_t period = (uint64_t)(1e9 / (dm && dm->refresh_rate > 1 ? dm->refresh_rate : 60.0f)), now = plat_now_ns();
             bool on_time = next_frame > now && next_frame - now <= period;  // (else late, or the rate changed: start over)
-            if (on_time) plat_sleep_until_ns(next_frame);
+            if (on_time && !xr_on()) plat_sleep_until_ns(next_frame);  // (VR: xrWaitFrame paces, at the headset's rate)
             next_frame = (on_time ? next_frame : now) + period;
             static const float clear_col[4] = {0.0f, 0.02f, 0.04f, 1};
-            if (!vk_frame_begin(clear_col)) { SDL_Delay(16); continue; }
+            xr_frame_begin();
+            if (!vk_frame_begin(clear_col)) { xr_frame_end(); SDL_Delay(16); continue; }
             ImGui_ImplVulkan_NewFrame();
             ImGui_ImplSDL3_NewFrame();
             // the backend (manual mode, no gamepads of its own) clears HasGamepad every frame, and ImGui then drops the
@@ -1856,6 +1860,7 @@ extern "C" void launcher_run(const char *root) {
             ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), (VkCommandBuffer)vk_frame_cmd());
             bool shot = shot_at && ++frame == shot_at;
             vk_frame_end(shot ? getenv("LARECOMP_SHOT_PATH") ? getenv("LARECOMP_SHOT_PATH") : "build/launcher.png" : NULL);
+            xr_frame_end();
             if (shot) exit(0);
             static int restart_in = 3;  // (installed: "Restarting..." on screen, then the new version)
             if (upd_s == UPD_DONE && --restart_in <= 0) {

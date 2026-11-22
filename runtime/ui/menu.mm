@@ -478,6 +478,8 @@ static bool choice(const char *label, int *value, const char *const *names, int 
 }
 
 extern "C" double output_scale_dynamic_factor(void);
+extern "C" bool xr_on(void);  // runtime/nvn/vulkan/xr.c (Video tab "VR headset")
+extern "C" void xr_recenter(void);
 extern "C" void vk_shader_record_counts(int *programs, int *pipelines);  // runtime/nvn/vulkan/exec.c
 extern "C" int texmods_count(void);                                      // runtime/nvn/vulkan/texmods.c
 extern "C" const char *texmods_folder(void);
@@ -548,6 +550,33 @@ static void tab_display(void) {
                "On: no tearing - the screen only ever shows whole frames.\n\nOff: each frame goes to the screen "
                "the moment it's done - a little less input lag, but tearing (a line across the image where two "
                "frames meet).");
+#ifdef PRIME_VR
+    opt_section("VR");
+    {   // (runtime/nvn/vulkan/xr.c: read at start-up, when the Vulkan device is made through the OpenXR runtime)
+        char d[700];
+        snprintf(d, sizeof d,
+                 "Plays on a VR headset through OpenXR - SteamVR, Meta Quest Link or Virtual Desktop, whichever is "
+                 "your OpenXR runtime. For now the game is shown on a big screen in front of you; the window "
+                 "mirrors it. While it's on, the frame rate follows the headset's refresh rate (60 to 120 Hz - a Quest's "
+                 "72 too) and HDR is off."
+                 "\n\nApplies when PrimeRecomp starts again.\n\n%s",
+                 xr_on() ? "VR is on." : g_settings.vr ? "No headset was found at start-up (the log says why)." : "");
+        opt_toggle("VR headset", &g_settings.vr, false, d);
+    }
+    opt_slider("VR screen distance", &g_settings.vr_screen_distance, VR_SCREEN_DIST_MIN, VR_SCREEN_DIST_MAX, 0.25f, 2.5f,
+               "%.2f m",
+               "How far ahead of you the screen is, in metres. Ahead of where your head was when the game started: "
+               "your headset's own recenter (SteamVR's, or holding the Oculus button) puts it in front of you again.");
+    opt_slider("VR screen size", &g_settings.vr_screen_width, VR_SCREEN_WIDTH_MIN, VR_SCREEN_WIDTH_MAX, 0.25f, 3.0f,
+               "%.2f m", "How wide the screen is, in metres.");
+    if (opt_button("Recenter VR",
+                   "In play, the game is all around you and turning your head looks around; aiming stays on the "
+                   "stick, gyro or mouse. Recenter makes where you face now straight ahead for Samus. Also: F7, and "
+                   "your headset's own recenter."))
+        xr_recenter();
+    opt_slider("VR world scale", &g_settings.vr_world_scale, VR_SCALE_MIN, VR_SCALE_MAX, 0.05f, 1.0f, "%.2fx",
+               "How far the view moves when you move your head (leaning, ducking). Higher: the world feels smaller.");
+#endif
     opt_section("HDR");
     {   // (runtime/nvn/vulkan/hdr.c; device.c makes the swapchain again on a change)
         int st = vk_hdr_status();
@@ -785,6 +814,13 @@ static void tab_gameplay(void) {
                               "directly, and Steam keeps the buttons and sticks.\n\nYour controller: %s.", src);
         opt_toggle("Gyro aiming", &g_settings.gyro, true, d);
     }
+    opt_section("Comfort");  // (runtime/hle/game.c comfort_frame, rt_shake_update; for VR above all)
+    opt_toggle("Head bob", &g_settings.head_bob, true,
+               "The view bobs up and down as Samus walks, sways a little while she stands still, and dips when she "
+               "lands. Off: the view stays steady - easier on the stomach, in VR above all.");
+    opt_toggle("Camera shake", &g_settings.camera_shake, true,
+               "Explosions, big enemies, rumbling rooms and hard landings shake the view. Off: they don't - in VR a "
+               "shaking view can make you feel sick.");
     opt_section("Cutscenes");
     opt_toggle("Skip any cutscene", &g_settings.skippable_cutscenes, false,
                "Every cutscene can be skipped with the game's own skip prompt, the first time too. The game normally "

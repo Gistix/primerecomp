@@ -88,7 +88,9 @@ Chat and news: the project's Discord server, https://discord.gg/CdwFjGCEGf (bug 
 
 ## Future work
 
-- Adding VR support
+- VR support: in progress. Windows builds play in a VR headset through OpenXR (Video tab > VR headset): in play the
+  game is all around you and your head turns the view (aiming stays on the stick, gyro or mouse); menus, the Morph
+  Ball and cutscenes go on a big screen in front of you. One image for both eyes for now: stereo 3D comes next
 
 ## Requirements
 

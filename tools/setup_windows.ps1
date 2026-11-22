@@ -18,6 +18,9 @@ $pkgs = 'make', 'mingw-w64-ucrt-x86_64-clang', 'mingw-w64-ucrt-x86_64-lld', 'min
         'mingw-w64-ucrt-x86_64-vulkan-memory-allocator', 'mingw-w64-ucrt-x86_64-vulkan-validation-layers',
         'mingw-w64-ucrt-x86_64-nasm'  # (make deps-windows: FFmpeg's VP9 assembly)
 & $bash -lc "pacman -S --needed --noconfirm $($pkgs -join ' ')"
+# VR headsets (runtime/nvn/vulkan/xr.c): the OpenXR headers and loader. On its own, so a mirror without it leaves the
+# rest installed (the build then has no VR: Makefile VR)
+& $bash -lc 'pacman -S --needed --noconfirm mingw-w64-ucrt-x86_64-openxr-sdk'
 
 # Python for the tools: the python.org build (prebuilt unicorn / capstone wheels; MSYS2's Python can't build them)
 $py = "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe"
