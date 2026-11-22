@@ -148,7 +148,16 @@ typedef struct TexBackend {
     uint32_t suit_gen;
     float mod_sx, mod_sy;
     struct ModImage *mod_img;
+    // VR stereo (exec.c backend_execute: each submission drawn again for the right eye): what's drawn into it
+    // differs per eye - drawn from the camera, or from what was - so the right eye draws into a twin of it (eye1,
+    // made on first use; sticky: shadow maps and the like stay shared, drawn once)
+    bool eye_dep;
+    struct TexBackend *eye1;
 } TexBackend;
+
+// VR stereo: the eye being drawn (exec.c) - 0 the left (and the window's), 1 the right: vk_tex gives eye-dependent
+// textures' twins then
+extern int g_eye;
 
 TexBackend *vk_tex(NvnTexture *t, bool for_render);  // backend image (uploads CPU contents unless for_render)
 VkFormat vk_format(uint32_t nvn_format);

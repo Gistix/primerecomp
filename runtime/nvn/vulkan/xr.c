@@ -2,6 +2,8 @@
 // layer, still in the room: the player can look around it); the game is drawn as on a monitor.
 #include "xr.h"
 
+#include <math.h>
+
 #ifndef PRIME_VR
 // (a build without the OpenXR headers - macOS, Linux, Android, or Windows without the SDK: no VR)
 bool xr_on(void) { return false; }
@@ -25,6 +27,11 @@ int xr_cam_sign(void) { return 1; }
 bool xr_head(float rot[9], float pos[3], uint32_t *id) { (void)rot, (void)pos, (void)id; return false; }
 void xr_head_used(uint32_t id, const float m[12]) { (void)id, (void)m; }
 void xr_note_view(const float vp[16], const float p[16]) { (void)vp, (void)p; }
+float xr_half_ipd(void) { return 0; }
+bool xr_stereo_wanted(void) { return false; }
+void xr_capture_eyes(VkCommandBuffer cb, VkImage l, VkImage r, VkFormat fmt, uint32_t w, uint32_t h, bool flip) {
+    (void)cb, (void)l, (void)r, (void)fmt, (void)w, (void)h, (void)flip;
+}
 
 #else
 #include <SDL3/SDL.h>
@@ -40,6 +47,8 @@ void xr_note_view(const float vp[16], const float p[16]) { (void)vp, (void)p; }
 
 #include "../../rt.h"
 #include "../../settings.h"
+
+bool xr_mat_inv4(const float m[16], float o[16]);
 
 // kernel.c: this thread's time blocked (waiting for the headset is idle time, not work: exec.c vk_pace_frame)
 extern __thread uint64_t g_blocked_ns;
@@ -61,6 +70,10 @@ static struct {
     uint64_t last_wait_ns;  // (when xrWaitFrame last returned: throttled frames go by without one)
     XrEnvironmentBlendMode blend;
     float vfov_deg;         // the eyes' vertical field of view (the widest), degrees: the game's while VR is on
+    float ipd_m;            // between the eyes, metres (the runtime's views)
+    // stereo (exec.c, each frame drawn for both eyes): the left and right game images, a swapchain each
+    struct { XrSwapchain sc; int64_t fmt; uint32_t w, h, n; XrSwapchainImageVulkan2KHR *img; } eye[2];
+    bool eyes_captured;
     // the screen: a swapchain the size of the window's game image, in the window's channel order, sRGB
     XrSwapchain sc;
     int64_t sc_fmt;
@@ -291,7 +304,7 @@ static void poll_events(void) {
 }
 
 void xr_frame_begin(void) {
-    X.in_frame = X.captured = false;
+    X.in_frame = X.captured = X.eyes_captured = false;
     if (!X.on) return;
     poll_events();
     if (!X.running) return;
@@ -335,6 +348,12 @@ void xr_frame_begin(void) {
             }
             if (deg > 30 && fabsf(deg - X.vfov_deg) > 0.5f) LOG("[xr] eyes' vertical field of view %.1f degrees\n", deg);
             if (deg > 30) X.vfov_deg = deg;
+            float dx = v[1].pose.position.x - v[0].pose.position.x, dy = v[1].pose.position.y - v[0].pose.position.y,
+                  dz = v[1].pose.position.z - v[0].pose.position.z, ipd = sqrtf(dx * dx + dy * dy + dz * dz);
+            if (ipd > 0.03f && ipd < 0.09f) {
+                if (fabsf(ipd - X.ipd_m) > 0.001f) LOG("[xr] eyes %.1f mm apart\n", ipd * 1000);
+                X.ipd_m = ipd;
+            }
         }
     }
     XrFrameBeginInfo bi = {.type = XR_TYPE_FRAME_BEGIN_INFO};
@@ -404,6 +423,84 @@ static void barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImage
     vkCmdPipelineBarrier2(cb, &di);
 }
 
+// ---- stereo: the game's left and right images (exec.c draws each frame for both eyes), a swapchain each, as big as
+// they are; copied byte for byte into the sRGB twin of their format (as the window's: srgb_of)
+static bool make_eye(int e, VkFormat fmt, uint32_t w, uint32_t h) {
+    VkFormat want = srgb_of(fmt);
+    if (X.eye[e].sc && X.eye[e].fmt == want && X.eye[e].w == w && X.eye[e].h == h) return true;
+    if (X.eye[e].sc) p_xrDestroySwapchain(X.eye[e].sc), X.eye[e].sc = XR_NULL_HANDLE;
+    free(X.eye[e].img), X.eye[e].img = NULL;
+    static int warned;
+    if (want == VK_FORMAT_UNDEFINED) {
+        if (!warned++) LOG("[xr] the game image's format %d isn't 8-bit RGBA: no stereo (both eyes the left's)\n", fmt);
+        return false;
+    }
+    XrSwapchainCreateInfo ci = {.type = XR_TYPE_SWAPCHAIN_CREATE_INFO,
+                                .usageFlags = XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT,
+                                .format = want, .sampleCount = 1, .width = w, .height = h, .faceCount = 1, .arraySize = 1,
+                                .mipCount = 1};
+    XrResult r = p_xrCreateSwapchain(X.session, &ci, &X.eye[e].sc);
+    if (XR_FAILED(r)) { if (!warned++) LOG("[xr] eye swapchain %ux%u: %s\n", w, h, res(r)); X.eye[e].sc = XR_NULL_HANDLE; return false; }
+    p_xrEnumerateSwapchainImages(X.eye[e].sc, 0, &X.eye[e].n, NULL);
+    X.eye[e].img = calloc(X.eye[e].n ? X.eye[e].n : 1, sizeof *X.eye[e].img);
+    for (uint32_t i = 0; i < X.eye[e].n; i++) X.eye[e].img[i].type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN2_KHR;
+    p_xrEnumerateSwapchainImages(X.eye[e].sc, X.eye[e].n, &X.eye[e].n, (XrSwapchainImageBaseHeader *)X.eye[e].img);
+    X.eye[e].fmt = want, X.eye[e].w = w, X.eye[e].h = h;
+    if (e) LOG("[xr] eye images %ux%u\n", w, h);
+    return true;
+}
+
+static void barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout to, VkAccessFlags2 src_access,
+                    VkAccessFlags2 dst_access);
+
+// The left and right game images (GENERAL layout, left so) into the eyes' swapchains: recorded into cb, which is
+// submitted before xr_frame_end
+void xr_capture_eyes(VkCommandBuffer cb, VkImage l, VkImage r, VkFormat fmt, uint32_t w, uint32_t h, bool flip) {
+    if (!X.in_frame || !X.should_render || !l || !r || !w || !h) return;
+    if (!make_eye(0, fmt, w, h) || !make_eye(1, fmt, w, h)) return;
+    uint64_t t0 = SDL_GetTicksNS();  // (the runtime's waits: idle - xr_capture)
+    for (int e = 0; e < 2; e++) {
+        uint32_t i = 0;
+        XrSwapchainImageAcquireInfo ai = {.type = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+        XrSwapchainImageWaitInfo wi = {.type = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO, .timeout = XR_INFINITE_DURATION};
+        if (XR_FAILED(p_xrAcquireSwapchainImage(X.eye[e].sc, &ai, &i)) || XR_FAILED(p_xrWaitSwapchainImage(X.eye[e].sc, &wi))) {
+            // (the first one's back: released with nothing new in it - the layer then uses the left image's last)
+            if (e) {
+                XrSwapchainImageReleaseInfo ri = {.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                p_xrReleaseSwapchainImage(X.eye[0].sc, &ri);
+            }
+            g_blocked_ns += SDL_GetTicksNS() - t0;
+            return;
+        }
+        VkImage src = e ? r : l, dst = X.eye[e].img[i].image;
+        barrier(cb, src, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        barrier(cb, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        if (flip && (int64_t)fmt == X.eye[e].fmt) {
+            // (the game's images upside down - its origin at the lower left: device.c's present flips them too - so
+            // turned over on the way; a blit between the same format, texel for texel, is the copy, turned)
+            VkImageBlit bl = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffsets = {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}},
+                              .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                              .dstOffsets = {{0, (int32_t)h, 0}, {(int32_t)w, 0, 1}}};
+            vkCmdBlitImage(cb, src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_NEAREST);
+        } else {
+            static int warned;
+            if (flip && !warned++) LOG("[xr] the game image (format %d) can't be turned over on the way: upside down\n", fmt);
+            VkImageCopy rg = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                              .extent = {w, h, 1}};
+            vkCmdCopyImage(cb, src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rg);
+        }
+        barrier(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT);
+    }
+    g_blocked_ns += SDL_GetTicksNS() - t0;
+    X.eyes_captured = true;
+}
+
+float xr_half_ipd(void) {  // (game units: the world scale's)
+    float s = g_settings.vr_world_scale > 0.1f ? g_settings.vr_world_scale : 1.0f;
+    return (X.ipd_m > 0 ? X.ipd_m : 0.063f) * 0.5f * s;
+}
+
 void xr_capture(VkCommandBuffer cb, VkImage img, VkFormat fmt, int x, int y, int w, int h) {
     if (!X.in_frame || !X.should_render || w <= 0 || h <= 0) return;
     if (!make_screen(fmt, (uint32_t)w, (uint32_t)h)) return;
@@ -463,6 +560,15 @@ static XrVector3f qrot(XrQuaternionf q, XrVector3f v) {
 }
 void xr_recenter(void) { recenter_req = true; }
 int xr_cam_sign(void) { return cam_sign ? cam_sign : 1; }
+// Draw the next frame for both eyes (exec.c vk_set_stereo): VR on, the Video tab's "VR stereo", and the head applied
+// lately (in play: not menus, the morph ball, cutscenes - on the screen, one image does)
+bool xr_stereo_wanted(void) {
+    if (!X.on || !X.running || X.throttled || !g_settings.vr_stereo || !hmx) return false;
+    SDL_LockMutex(hmx);
+    bool head = last.cam && SDL_GetTicksNS() - last.ns < 150000000ull;
+    SDL_UnlockMutex(hmx);
+    return head;
+}
 float xr_vfov(void) { return X.on && X.running && X.vfov_deg > 0 ? X.vfov_deg : 0; }
 
 bool xr_head(float rot[9], float pos[3], uint32_t *id) {
@@ -514,30 +620,6 @@ void xr_head_used(uint32_t id, const float m[12]) {
     SDL_UnlockMutex(hmx);
 }
 
-static bool inv4(const float m[16], float o[16]) {  // (a 4x4 inverse, by cofactors)
-    float a[16];
-    a[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
-    a[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
-    a[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
-    a[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
-    a[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
-    a[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
-    a[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
-    a[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
-    a[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
-    a[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
-    a[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
-    a[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
-    a[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
-    a[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
-    a[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
-    a[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
-    float det = m[0] * a[0] + m[1] * a[4] + m[2] * a[8] + m[3] * a[12];
-    if (!(fabsf(det) > 1e-20f)) return false;
-    for (int i = 0; i < 16; i++) o[i] = a[i] / det;
-    return true;
-}
-
 // Render thread: the camera of this frame's first world draw - view-projection and projection, column-major, OpenGL
 // clip space (runtime/nvn/vulkan/exec.c): the frame's extent for the headset, and which way the game's camera looks
 void xr_note_view(const float vp[16], const float p[16]) {
@@ -548,7 +630,7 @@ void xr_note_view(const float vp[16], const float p[16]) {
     fv.tan[2] = (p[9] + 1) / p[5], fv.tan[3] = (p[9] - 1) / p[5];
     if (cam_sign) return;  // (known: the rest is only to find it)
     float pi[16], v[16];
-    if (!inv4(p, pi)) return;
+    if (!xr_mat_inv4(p, pi)) return;
     for (int c = 0; c < 4; c++)  // V = P^-1 VP: world -> view
         for (int r = 0; r < 4; r++)
             v[c * 4 + r] = pi[r] * vp[c * 4] + pi[4 + r] * vp[c * 4 + 1] + pi[8 + r] * vp[c * 4 + 2] + pi[12 + r] * vp[c * 4 + 3];
@@ -586,6 +668,12 @@ void xr_frame_end(void) {
         XrSwapchainImageReleaseInfo ri = {.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
         p_xrReleaseSwapchainImage(X.sc, &ri);
     }
+    bool eyes = X.eyes_captured;  // (stereo: the left and right game images, xr_capture_eyes)
+    for (int e = 0; eyes && e < 2; e++) {
+        XrSwapchainImageReleaseInfo ri = {.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        p_xrReleaseSwapchainImage(X.eye[e].sc, &ri);
+    }
+    X.eyes_captured = false;
     // the screen: Video tab "VR screen size" wide (metres), "VR screen distance" ahead of where the player's head was
     // when the session began, at eye height
     float dist = g_settings.vr_screen_distance > 0.5f ? g_settings.vr_screen_distance : 2.5f;
@@ -596,20 +684,30 @@ void xr_frame_end(void) {
                                 .pose = {.orientation = {0, 0, 0, 1}, .position = {0, 0, -dist}},
                                 .size = {width, X.sc_w ? width * (float)X.sc_h / (float)X.sc_w : width * 9 / 16}};
     // In play with the head applied (and not the F1 menu over it): the image all around, as seen from the pose it was
-    // drawn with - both eyes the same image for now (no depth: that's the stereo to come) - in the extent of its
-    // projection. The runtime turns it by the head's movement since.
+    // drawn with, in the extent of its projection - the runtime turns it by the head's movement since. Stereo: each
+    // eye its own image, from its own place (half the eyes' distance to the head's side); else both the window's.
     extern bool menu_input_captured(void);  // runtime/ui/menu.mm
     XrCompositionLayerProjectionView pv[2];
-    for (int i = 0; i < 2; i++)
+    for (int i = 0; i < 2; i++) {
+        XrPosef ep = pose;
+        if (eyes) {
+            XrVector3f off = qrot(pose.orientation, (XrVector3f){(i ? 0.5f : -0.5f) * (X.ipd_m > 0 ? X.ipd_m : 0.063f), 0, 0});
+            ep.position.x += off.x, ep.position.y += off.y, ep.position.z += off.z;
+        }
         pv[i] = (XrCompositionLayerProjectionView){
-            .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW, .pose = pose,
+            .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW, .pose = ep,
             .fov = {atanf(tan[0]), atanf(tan[1]), atanf(tan[2]), atanf(tan[3])},
-            .subImage = {.swapchain = X.sc, .imageRect = {{0, 0}, {(int32_t)X.sc_w, (int32_t)X.sc_h}}}};
+            .subImage = eyes ? (XrSwapchainSubImage){.swapchain = X.eye[i].sc, .imageRect = {{0, 0}, {(int32_t)X.eye[i].w, (int32_t)X.eye[i].h}}}
+                             : (XrSwapchainSubImage){.swapchain = X.sc, .imageRect = {{0, 0}, {(int32_t)X.sc_w, (int32_t)X.sc_h}}}};
+    }
     XrCompositionLayerProjection pl = {.type = XR_TYPE_COMPOSITION_LAYER_PROJECTION, .space = X.space, .viewCount = 2,
                                        .views = pv};
     bool around = head && !menu_input_captured();
     static int was = -1;
-    if (X.captured && around != was) LOG("[xr] %s\n", around ? "the game all around (head tracked)" : "the game on the screen"), was = around;
+    int now = around ? (eyes ? 2 : 1) : 0;
+    if (X.captured && now != was)
+        LOG("[xr] %s\n", now == 2 ? "the game all around, in stereo" : now ? "the game all around (head tracked)" : "the game on the screen"),
+            was = now;
     const XrCompositionLayerBaseHeader *layers[] = {around ? (const XrCompositionLayerBaseHeader *)&pl
                                                            : (const XrCompositionLayerBaseHeader *)&q};
     XrFrameEndInfo ei = {.type = XR_TYPE_FRAME_END_INFO, .displayTime = X.display_time, .environmentBlendMode = X.blend,
@@ -623,3 +721,28 @@ void xr_frame_end(void) {
     X.captured = false;
 }
 #endif
+
+// A 4x4 inverse, by cofactors (column-major or not alike); false: singular. Here and exec.c (VR stereo)
+bool xr_mat_inv4(const float m[16], float o[16]) {
+    float a[16];
+    a[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+    a[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+    a[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+    a[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+    a[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+    a[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+    a[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+    a[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+    a[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+    a[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+    a[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+    a[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+    a[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+    a[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+    a[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+    a[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+    float det = m[0] * a[0] + m[1] * a[4] + m[2] * a[8] + m[3] * a[12];
+    if (!(fabsf(det) > 1e-20f)) return false;
+    for (int i = 0; i < 16; i++) o[i] = a[i] / det;
+    return true;
+}

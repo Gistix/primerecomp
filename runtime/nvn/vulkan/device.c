@@ -906,6 +906,16 @@ void backend_present(NvnTexture *t) {
         float pv[8] = {renderer_origin_lower_left() ? 1.0f : 0.0f, 0, 0, 0, crop[0], crop[1], crop[2], crop[3]};
         memcpy(g_shot_crop, crop, sizeof crop);
         vk_present_draw(cb, b, (float)vx, (float)vy, (float)vw, (float)vh, pv);
+        {   // VR stereo: this frame was drawn for both eyes (exec.c): the left and right game images to the headset
+            extern bool vk_stereo(void);
+            extern TexBackend *vk_tex_eye1(NvnTexture *t);
+            TexBackend *r = vk_stereo() ? vk_tex_eye1(t) : NULL;
+            if (r && b->image && r->image && r->width == b->width && r->height == b->height) {
+                vk_frame_suspend();  // (copies and layout changes: outside the window image's rendering)
+                xr_capture_eyes(vk_cmd(), b->image, r->image, b->format, b->width, b->height, renderer_origin_lower_left());
+                vk_frame_resume();
+            }
+        }
         static long menu_at = -1;
         if (menu_at < 0) menu_at = getenv("LARECOMP_MENU_AT") ? atol(getenv("LARECOMP_MENU_AT")) : 0;
         if (menu_at && (long)total_frames + 1 == menu_at) { extern void menu_test_open(void); menu_test_open(); }
@@ -933,6 +943,8 @@ void backend_present(NvnTexture *t) {
         renderer_submit();
     }
     xr_frame_end();  // (after the submission with the headset's copy in it: vk_frame_end)
+    extern void vk_set_stereo(bool on);
+    vk_set_stereo(xr_stereo_wanted());  // (the next frame: for both eyes, in play with VR stereo on)
     extern void vk_prof_frame(uint64_t frame, uint64_t present_ns);
     vk_prof_frame(total_frames, SDL_GetTicksNS() - t0);
     frames++;

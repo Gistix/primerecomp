@@ -439,6 +439,11 @@ static uint32_t level_w(const TexBackend *b, uint32_t lv) { uint32_t v = b->widt
 static uint32_t level_h(const TexBackend *b, uint32_t lv) { uint32_t v = b->height >> lv; return v ? v : 1; }
 
 static void destroy_image(TexBackend *b) {
+    if (b->eye1) {  // (VR: its right-eye twin goes with it; made again at its next use: eye_twin)
+        destroy_image(b->eye1);
+        free(b->eye1);
+        b->eye1 = NULL;
+    }
     views_forget(b);
     if (b->image || b->mem) defer((Dead){.img = b->image, .mem = b->mem});  // (never the same allocation twice)
     b->image = VK_NULL_HANDLE;
@@ -1442,6 +1447,25 @@ upload:
     }
 }
 
+// VR stereo: the right eye's twin of an eye-dependent image (vk.h TexBackend.eye_dep) - the same shape, made as the
+// image itself was (create_image), on its first use and again after the image was made anew (destroy_image drops it)
+int g_eye;
+static TexBackend *eye_twin(NvnTexture *t, TexBackend *b) {
+    TexBackend *e = b->eye1;
+    if (e && e->image && e->width == b->width && e->height == b->height && e->format == b->format) return e;
+    if (e) { destroy_image(e); free(e); }
+    e = calloc(1, sizeof *e);
+    e->scalable = b->scalable;
+    create_image(t, e, true);
+    e->gpu_owned = e->uploaded = true;
+    e->refs = 1;
+    e->eye_dep = true;
+    b->eye1 = e;
+    static int nlog;
+    if (nlog++ < 40) LOG("[vr] right-eye twin of %p: %ux%u format %d\n", (void *)t, e->width, e->height, e->format);
+    return e;
+}
+
 TexBackend *vk_tex(NvnTexture *t, bool for_render) {
     TexBackend *b = tex_backend_for(t, for_render);
     if (b->pending_rgba) upload_pending(b);
@@ -1452,7 +1476,14 @@ TexBackend *vk_tex(NvnTexture *t, bool for_render) {
         upload_texture(t, b);
         if (prof_up_ns != ~0ull) prof_up_ns += SDL_GetTicksNS() - t0;
     }
+    if (g_eye == 1 && b->eye_dep) return eye_twin(t, b);
     return b;
+}
+
+// VR stereo: t's right-eye image when it has one (else its own) - the presented image's (device.c)
+TexBackend *vk_tex_eye1(NvnTexture *t) {
+    TexBackend *b = t ? t->backend : NULL;
+    return b && b->eye_dep && b->eye1 && b->eye1->image ? b->eye1 : b;
 }
 
 void renderer_mark_gpu_owned(NvnTexture *t) { tex_backend_for(t, true)->gpu_owned = true; }

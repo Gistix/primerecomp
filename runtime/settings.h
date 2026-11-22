@@ -101,6 +101,8 @@ typedef struct {
     float vr_screen_distance;  // VR: the screen the game is shown on, this far ahead (metres; xr.c)
     float vr_screen_width;     // VR: ... and this wide (metres)
     float vr_world_scale;      // VR: game units per metre the head moves (1: the game's units as metres)
+    bool vr_stereo;            // VR: in play each eye sees its own image - depth - drawn twice a frame (Vulkan
+                               // exec.c); off: one image for both
     bool preload_shaders;  // the start screen builds every shader recorded so far before PLAY (runtime/nvn/vulkan/exec.c
                            // vk_preload_start): nothing seen before pops in when it's first drawn in a session
     bool texture_mods;   // the game's textures replaced by the files in mods/ (runtime/nvn/vulkan/texmods.c), from start

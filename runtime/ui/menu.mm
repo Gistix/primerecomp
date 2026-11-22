@@ -575,7 +575,11 @@ static void tab_display(void) {
                    "your headset's own recenter."))
         xr_recenter();
     opt_slider("VR world scale", &g_settings.vr_world_scale, VR_SCALE_MIN, VR_SCALE_MAX, 0.05f, 1.0f, "%.2fx",
-               "How far the view moves when you move your head (leaning, ducking). Higher: the world feels smaller.");
+               "How big the world feels: how far apart your eyes are in it (and how far the view would move as you "
+               "lean). Higher: the world feels smaller.");
+    opt_toggle("VR stereo", &g_settings.vr_stereo, true,
+               "In play each eye sees its own image, so the world has depth. Each frame is drawn twice, so it needs "
+               "more of your computer. Off: one image for both eyes - flat, but lighter.");
 #endif
     opt_section("HDR");
     {   // (runtime/nvn/vulkan/hdr.c; device.c makes the swapchain again on a change)

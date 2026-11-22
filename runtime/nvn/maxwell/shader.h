@@ -49,8 +49,9 @@ typedef struct {
     uint8_t x_mode;         // bit 0: mirror the image left to right (mirror mode's scene composite); bit 1 (vertex,
                             // GLSL): ultrawide edge stretch - clip x divided by rscale[0].x, vertices at the left /
                             // right edge (|x / w| > 0.995) put on the window's edge instead (Vulkan exec.c: UI boxed
-                            // into the 16:9 middle). (In the padding after flip_y: keys without it hash as before -
-                            // shader caches stay valid.)
+                            // into the 16:9 middle); bit 2 (vertex / geometry, GLSL): VR stereo's eye correction -
+                            // gl_Position times the matrix in rscale[66..69] (exec.c eye_correction). (In the padding
+                            // after flip_y: keys without it hash as before - shader caches stay valid.)
     uint8_t gs_follows;     // vertex, GLSL: a geometry shader takes the outputs (it does the clip space epilogue)
     uint32_t vs_out_mask;   // fragment: varyings the vertex shader provides (geometry: its inputs; fragment after a
                             // geometry shader: the geometry shader's outputs)

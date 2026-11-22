@@ -48,6 +48,13 @@ void xr_head_used(uint32_t id, const float cam[12]);  // the camera made with it
 // Render thread (exec.c): the view-projection and projection of the frame's first world draw (column-major)
 void xr_note_view(const float vp[16], const float p[16]);
 void xr_recenter(void);  // straight ahead becomes where the head faces now (F7, Video tab)
+
+// ---- stereo (Phase 3): exec.c draws each frame for both eyes (vk_set_stereo)
+bool xr_stereo_wanted(void);  // the next frame for both eyes (in play, the Video tab's "VR stereo")
+float xr_half_ipd(void);      // half the eyes' distance, game units
+// the left and right game images (GENERAL layout), into the eyes' views; cb is submitted before xr_frame_end
+void xr_capture_eyes(VkCommandBuffer cb, VkImage l, VkImage r, VkFormat fmt, uint32_t w, uint32_t h, bool flip);
+bool xr_mat_inv4(const float m[16], float o[16]);  // 4x4 inverse (false: singular)
 float xr_vfov(void);     // the eyes' vertical field of view, degrees (0: not known): the game's while VR is on
 
 #ifdef __cplusplus

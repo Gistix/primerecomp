@@ -2340,10 +2340,12 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         sp(&s, "uint gfind(uint g) { uint n = gmap[%d].x; for (uint i = 0u; i < n; i++) { uint o = g - gmap[i].x; "
                "if (g >= gmap[i].x && o < gmap[i].y) return gmap[i].z + (o >> 2); } return 0xFFFFFFFFu; }\n", GMAP_MAX);
     }
-    // (the ultrawide edge stretch reads rscale[0].x in the vertex epilogue: x_mode bit 1)
-    if (c->uses_rscale || (stage == STAGE_VERTEX && key && (key->x_mode & 2))) {
+    // (the ultrawide edge stretch reads rscale[0].x in the vertex epilogue: x_mode bit 1; VR stereo's eye correction
+    // rscale[66..69] in the vertex or geometry epilogue: bit 2)
+    bool eye = key && (key->x_mode & 4) && (stage == STAGE_VERTEX || stage == STAGE_GEOMETRY);
+    if (c->uses_rscale || (stage == STAGE_VERTEX && key && (key->x_mode & 2)) || eye) {
         sp(&s, "layout(std140, set = %d, binding = 18) uniform RScale { vec4 rscale[%d]; };\n", set,
-           key && (key->x_mode & 1) ? 66 : 65);  // ([65]: mirror mode's render target width)
+           eye ? 70 : key && (key->x_mode & 1) ? 66 : 65);  // ([65]: mirror mode's render target width)
         info->uses_rscale = true;
     }
     for (int i = 0; i < info->nimg; i++) {
@@ -2448,6 +2450,8 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         sp(&s, "void gs_emit() {\n");
         if (xfb) sp(&s, "  xfb_emit();\n");
         sp(&s, "  gl_Position = gs_pos;\n");
+        if (key && (key->x_mode & 4))  // VR stereo's eye correction (exec.c eye_correction)
+            sp(&s, "  gl_Position = mat4(rscale[66], rscale[67], rscale[68], rscale[69]) * gl_Position;\n");
         if (key && key->flip_y) sp(&s, "  gl_Position.y = -gl_Position.y;\n");
         if (key && (key->x_mode & 1)) sp(&s, "  gl_Position.x = -gl_Position.x;\n");
         if (key && key->depth_minus_one) sp(&s, "  gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5f;\n");
@@ -2488,6 +2492,8 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         if (key && (key->x_mode & 2))  // ultrawide edge stretch (shader.h ShaderKey.x_mode)
             sp(&s, "  { float ew_ = gl_Position.w, ex_ = ew_ != 0.0 ? gl_Position.x / ew_ : 0.0;\n"
                    "    gl_Position.x = abs(ex_) > 0.995 ? sign(ex_) * abs(ew_) : gl_Position.x / rscale[0].x; }\n");
+        if (key && (key->x_mode & 4))  // VR stereo's eye correction (exec.c eye_correction): as seen from the eye
+            sp(&s, "  gl_Position = mat4(rscale[66], rscale[67], rscale[68], rscale[69]) * gl_Position;\n");
         if (key && key->flip_y) sp(&s, "  gl_Position.y = -gl_Position.y;\n");
         if (key && (key->x_mode & 1)) sp(&s, "  gl_Position.x = -gl_Position.x;\n");
         if (key && key->depth_minus_one) sp(&s, "  gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5f;\n");

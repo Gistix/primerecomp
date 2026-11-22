@@ -38,6 +38,7 @@ Settings g_settings = {
     .vr_screen_distance = 2.5f,
     .vr_screen_width = 3.0f,
     .vr_world_scale = 1.0f,
+    .vr_stereo = true,
     .head_bob = true,
     .camera_shake = true,
     .hint_on_l3 = true,
@@ -239,6 +240,8 @@ void settings_load(void) {
         } else if (!strcmp(key, "vr_screen_width")) {
             float v = (float)atof(val);
             if (v >= VR_SCREEN_WIDTH_MIN && v <= VR_SCREEN_WIDTH_MAX) g_settings.vr_screen_width = v;
+        } else if (!strcmp(key, "vr_stereo")) {
+            g_settings.vr_stereo = atoi(val) != 0;
         } else if (!strcmp(key, "vr_world_scale")) {
             float v = (float)atof(val);
             if (v >= VR_SCALE_MIN && v <= VR_SCALE_MAX) g_settings.vr_world_scale = v;
@@ -404,6 +407,7 @@ static void write_settings(void *o) {
     put(o, "vr_screen_distance = %.2f\n", g_settings.vr_screen_distance);
     put(o, "vr_screen_width = %.2f\n", g_settings.vr_screen_width);
     put(o, "vr_world_scale = %.2f\n", g_settings.vr_world_scale);
+    put(o, "vr_stereo = %d\n", g_settings.vr_stereo);
     put(o, "preload_shaders = %d\n", g_settings.preload_shaders);
     put(o, "texture_mods = %d\ndump_textures = %d\n", g_settings.texture_mods, g_settings.dump_textures);
     if (g_settings.mods_order[0]) put(o, "mods_order = %s\n", g_settings.mods_order);

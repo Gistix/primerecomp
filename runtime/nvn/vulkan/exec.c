@@ -1471,7 +1471,7 @@ static bool dlss_depth_ok(const TexBackend *b) {
 
 // A draw that writes depth (fn: NVN's depth function)
 static void dlss_note_draw(NvnTexture *t, uint8_t fn) {
-    if (!dlss_wanted() || !t) return;
+    if (!dlss_wanted() || !t || g_eye) return;  // (VR stereo: the left eye's only)
     TexBackend *b = t->backend;
     if (!dlss_depth_ok(b)) return;
     dl.depth = b;
@@ -1483,7 +1483,7 @@ static void dlss_note_draw(NvnTexture *t, uint8_t fn) {
 // A world draw that writes depth (zn: where its depth range starts): the frame's camera from its vertex cbuf 3, the
 // first one a frame. Taken only when cbuf 3 is the camera's block: 544 bytes, a perspective projection at +352.
 static void dlss_note_camera(uint32_t vcbuf_mask, float zn) {
-    if (dl.vp_ok || !dlss_wanted() || !((vcbuf_mask >> 3) & 1)) return;
+    if (dl.vp_ok || !dlss_wanted() || g_eye || !((vcbuf_mask >> 3) & 1)) return;
     Range u = st.ubuf[0][0];
     if (!u.addr || u.size < 544) return;
     const float *f = (const float *)(uintptr_t)u.addr, *p = f + 88;
@@ -1496,22 +1496,72 @@ static void dlss_note_camera(uint32_t vcbuf_mask, float zn) {
     dl.zworld = zn;
 }
 
-// VR (xr.c): the same camera block, for which head pose the frame was drawn with (xr_note_view takes the frame's first)
+// VR (xr.c): the draw's camera block in vertex cbuf 3 - view-projection at +0, a perspective projection at +352
+static const float *vr_camera_block(uint32_t vcbuf_mask) {
+    if (!((vcbuf_mask >> 3) & 1)) return NULL;
+    Range u = st.ubuf[0][0];
+    if (!u.addr || u.size < 544) return NULL;
+    const float *f = (const float *)(uintptr_t)u.addr, *p = f + 88;
+    if (!(p[0] > 0.1f && p[5] > 0.1f && p[11] == -1.0f && p[15] == 0.0f) || !(fabsf(f[5]) > 0.1f)) return NULL;
+    return f;
+}
+// the frame's projection and which way the camera looks (xr_note_view takes the frame's first)
 static void vr_note_camera(uint32_t vcbuf_mask) {
     extern bool xr_on(void);
     extern void xr_note_view(const float vp[16], const float p[16]);
-    if (!xr_on() || !((vcbuf_mask >> 3) & 1)) return;
-    Range u = st.ubuf[0][0];
-    if (!u.addr || u.size < 544) return;
-    const float *f = (const float *)(uintptr_t)u.addr, *p = f + 88;
-    if (!(p[0] > 0.1f && p[5] > 0.1f && p[11] == -1.0f && p[15] == 0.0f) || !(fabsf(f[5]) > 0.1f)) return;
-    xr_note_view(f, p);
+    if (!xr_on() || g_eye) return;
+    const float *f = vr_camera_block(vcbuf_mask);
+    if (f) xr_note_view(f, f + 88);
+}
+
+// ---- VR stereo: each submission is drawn twice, the left eye then the right (backend_execute). A draw seen from the
+// camera (its block in cbuf 3, the world's or the gun's depth range) gets the eye's correction in its vertex shader:
+// gl_Position = P T P^-1 gl_Position (ShaderKey.x_mode bit 4, the matrix in rscale[66..69]) - P its own projection,
+// T the eye's half-IPD sideways in view space - so it's as seen from that eye, whatever its shader's matrices are.
+// Its render targets are eye-dependent from then on (TexBackend.eye_dep), and so are those of a draw or copy that
+// reads one. The right eye replays only what writes eye-dependent targets - into their twins (textures.c eye_twin) -
+// and nothing that writes guest memory, counts or signals (readbacks, queries, fences, uploads, compute). Eye-
+// independent work (shadow maps, the sky's probes) is drawn once, as before.
+static bool g_stereo;          // this frame is drawn for both eyes (vk_set_stereo, at each present)
+static bool g_draw_reads_eye;  // (the draw being recorded samples an eye-dependent texture)
+static float g_eye_rows[4][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}};  // (the correction's columns)
+bool vk_stereo(void) { return g_stereo; }
+void vk_set_stereo(bool on) {
+    if (on != g_stereo) LOG("[vr] stereo %s\n", on ? "on: each frame drawn for both eyes" : "off");
+    g_stereo = on;
+}
+static bool tex_eye_dep(const NvnTexture *t) { return t && t->backend && ((const TexBackend *)t->backend)->eye_dep; }
+static bool rt_eye_dep(void) {
+    for (int i = 0; i < st.rt.ncolor; i++) if (tex_eye_dep(st.rt.color[i])) return true;
+    return tex_eye_dep(st.rt.depth);
+}
+static void mark_eye_dep(NvnTexture *t) {
+    TexBackend *b = t ? t->backend : NULL;
+    if (!b || b->eye_dep) return;
+    b->eye_dep = true;
+    static int nlog;
+    if (nlog++ < 60) LOG("[vr] eye-dependent: %p %ux%u format %#x\n", (void *)t, t->width, t->height, t->format);
+}
+static void rt_mark_eye_dep(void) {
+    for (int i = 0; i < st.rt.ncolor; i++) mark_eye_dep(st.rt.color[i]);
+    mark_eye_dep(st.rt.depth);
+}
+// The eye's correction for a draw with projection p (column-major): P T P^-1, T moving the view by `ex` along x
+static bool eye_correction(const float p[16], float ex) {
+    extern bool xr_mat_inv4(const float m[16], float o[16]);
+    float pi[16];
+    if (!xr_mat_inv4(p, pi)) return false;
+    // P T P^-1 = I + ex * (P's column 0) (P^-1's row 3): T - I has ex at row 0, column 3 only
+    for (int c = 0; c < 4; c++)
+        for (int r = 0; r < 4; r++) g_eye_rows[c][r] = (r == c) + ex * p[r] * pi[c * 4 + 3];
+    return true;
 }
 
 static VkFormat raw_format(const TexBackend *b);
 // Before a draw's pass begins: the first camera-attached draw (depth range under 0.039, not the gun's) into the image
 // that gets presented, after the world: the image as it is, copied into dl.hud (the HUD mask, dlss_mv)
 static void dlss_before_draw(void) {
+    if (g_eye) return;  // (VR stereo: the left eye's only)
     static int off = -1;
     if (off < 0) off = getenv("LARECOMP_TU_NO_HUD_MASK") != NULL || getenv("LARECOMP_TU_NO_MOTION") != NULL;
     if (off || !dl.vp_ok || dl.hud_valid || !st.rt.ncolor || !st.rt.color[0] || !dlss_wanted()) return;
@@ -1582,7 +1632,7 @@ static void dlss_snapshot(TexBackend *src) {
 
 // A depth clear is about to run (v: its value)
 static void dlss_before_depth_clear(NvnTexture *t, float v) {
-    if (!dlss_wanted() || !t) return;
+    if (!dlss_wanted() || !t || g_eye) return;
     TexBackend *b = t->backend;
     if (!dlss_depth_ok(b)) return;
     if (v <= 0.0f) dl.inv++;
@@ -3441,7 +3491,7 @@ static void alias_copy(CopyAlias *a, VkImageAspectFlags aspects, const char *why
 
 // t is about to be written; full: the aspects of it the write overwrites whole (0: unknown / partial)
 static void alias_before_write(NvnTexture *t, VkImageAspectFlags full, const char *why) {
-    if (!naliases || !t) return;
+    if (!naliases || !t || g_eye) return;  // (VR stereo's right eye: twins have no aliases)
     for (int i = naliases - 1; i >= 0; i--) {
         CopyAlias *a = &aliases[i];
         if (!alias_valid(a)) { alias_drop(i); continue; }
@@ -4426,17 +4476,20 @@ static void texture_info_elem(int stage, const ShaderTexture *st_, uint32_t elem
             extern uint64_t vk_frame_counter(void);
             static int nomemo = -1;
             if (nomemo < 0) nomemo = getenv("LARECOMP_VK_NO_TEX_MEMO") != NULL;
-            static struct { NvnTexture *tex; uint64_t vh, frame; uint32_t gen; uint8_t type, has_view; VkImageView view; } memo[1024];
+            // (VR stereo: the eye too - the right eye's view of an eye-dependent texture is its twin's)
+            static struct { NvnTexture *tex; uint64_t vh, frame; uint32_t gen; uint8_t type, has_view, eye; VkImageView view; } memo[1024];
             uint64_t vh = e->has_view ? hash_words(0, &e->view, sizeof e->view) : 0, frame = vk_frame_counter();
             uint32_t ms = (uint32_t)((((uintptr_t)e->tex >> 4) ^ vh ^ (uint64_t)st_->type * 0x9E3779B97F4A7C15ull) & 1023);
             if (!nomemo && memo[ms].tex == e->tex && memo[ms].vh == vh && memo[ms].frame == frame && memo[ms].gen == vk_view_gen &&
-                memo[ms].type == st_->type && memo[ms].has_view == e->has_view) {
+                memo[ms].type == st_->type && memo[ms].has_view == e->has_view && memo[ms].eye == g_eye) {
                 view = memo[ms].view;
             } else {
                 view = vk_view(naliases ? alias_read(e->tex) : e->tex, &e->view, e->has_view, false, st_->type);
                 memo[ms].tex = e->tex; memo[ms].vh = vh; memo[ms].frame = frame; memo[ms].gen = vk_view_gen;
                 memo[ms].type = (uint8_t)st_->type; memo[ms].has_view = e->has_view; memo[ms].view = view;
+                memo[ms].eye = (uint8_t)g_eye;
             }
+            if (tex_eye_dep(naliases ? alias_read(e->tex) : e->tex)) g_draw_reads_eye = true;
             renderer_texture_scale(e->tex, &sc[0], &sc[1]);
             {   // a texture mod's image: its size over the game's, for texel lookups (texmods.c)
                 TexBackend *tb = (TexBackend *)e->tex->backend;
@@ -4484,6 +4537,7 @@ static VkImageView image_view(int stage, const ShaderTexture *im) {
         LOG("[draw]   image (stage %d): %p %ux%ux%u f%#x target %u addr %llx type %d\n", stage, (void *)e->tex, e->tex->width,
             e->tex->height, e->tex->depth, e->tex->format, e->tex->target, (unsigned long long)e->tex->addr, im->type);
     renderer_mark_gpu_owned(e->tex);
+    if (tex_eye_dep(e->tex)) g_draw_reads_eye = true;
     return vk_view(e->tex, &e->view, e->has_view, true, im->type);
 }
 
@@ -4502,9 +4556,10 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
     uint32_t narr = 0;
     int n = 0;
     int sg = stage == 1 ? 1 : 0;
-    float rs[66][4] = {{1, 1, 0, 0}};  // ([65]: mirror mode)
+    float rs[70][4] = {{1, 1, 0, 0}};  // ([65]: mirror mode; [66..69]: VR stereo's eye correction, its columns)
     if (rscale_row0) memcpy(rs[0], rscale_row0, 16);
     rs[65][0] = g_mirror_w;
+    memcpy(rs[66], g_eye_rows, sizeof g_eye_rows);
     // (the patched tonemapper: hdr.c hdr_patch_tonemap)
     rs[64][1] = vk_hdr_scene_gain(), rs[64][2] = vk_hdr_shoulder(), rs[64][3] = vk_hdr_wide();
     for (int i = 0; i < p->nbinds; i++) {
@@ -5305,6 +5360,8 @@ static void draw(CmdRec *r, bool indexed) {
 }
 static uint64_t prof_tp_;
 static void draw_(CmdRec *r, bool indexed) {
+    if (g_eye == 1 && (!rt_eye_dep() || xfb_active)) return;  // (VR stereo, the right eye: only what differs per eye)
+    g_draw_reads_eye = false;
     if (prof) prof_tp_ = SDL_GetTicksNS();
     if (!st.program) SKIP(SKIP_NOPROG);
     ShaderKey vkey = {0}, fkey = {0};
@@ -5455,6 +5512,23 @@ static void draw_(CmdRec *r, bool indexed) {
         if (p2 && atomic_load(&p2->state) == 1) pr = p2, edge = true, edge_k = pass_sx / pass_sy;
     }
     vp_edge = edge;
+    // VR stereo: a draw seen from the camera - the world's depth range or the gun's, the camera's block in cbuf 3 -
+    // through the eye-corrected variant (still compiling: drawn as it is, both eyes alike for a moment)
+    bool eye_cam = false;
+    if (g_stereo && !edge && !pr->has_gs && !pr->gs_emul) {
+        float zn = st.depth_range[0][0], zf = st.depth_range[0][1];
+        bool world = zf == 1.0f && zn > 0.03f && zn < 0.05f, gun = zn == 0.009765623f && zf == 0.038671874f;
+        const float *cam = world || gun ? vr_camera_block(pr->vi->cbuf_mask) : NULL;
+        extern float xr_half_ipd(void);
+        if (cam && eye_correction(cam + 88, g_eye ? -xr_half_ipd() : xr_half_ipd())) {
+            ShaderKey vk3 = vkey;
+            vk3.x_mode |= 4;
+            Prog *p3 = get_program(st.program, &vk3, &fkey, cls0);
+            if (p3 && atomic_load(&p3->state) == 0 && small_targets()) wait_built(&p3->state, p3);
+            if (p3 && atomic_load(&p3->state) == 1) pr = p3;
+            eye_cam = true;  // (eye-dependent all the same: its targets get twins)
+        }
+    }
 
     uint32_t mode = (uint32_t)r->x[0];
     VkPrimitiveTopology topo;
@@ -5819,6 +5893,7 @@ static void draw_(CmdRec *r, bool indexed) {
         free(hud_split.inst_side);
     } else if (!use_index) vkCmdDraw(cb, count, inst, first, base_inst);
     else vkCmdDrawIndexed(cb, icount, inst, 0, base_vertex, base_inst);
+    if (g_stereo && g_eye == 0 && (eye_cam || g_draw_reads_eye)) rt_mark_eye_dep();  // (VR stereo: see vk_set_stereo)
     stat_draws++;
     cum_draws++;
     if (g_gpuprof_frame && gp_n) {
@@ -6202,9 +6277,12 @@ static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
 }
 
 static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t flags) {
-    snap_reason = "tex2tex"; snapshots_invalidate(NULL);
     NvnTexture *st_ = (NvnTexture *)(uintptr_t)src->tex, *dt = (NvnTexture *)(uintptr_t)dst->tex;
     if (!st_ || !dt) return;
+    // VR stereo: a copy of an eye-dependent image makes another; the right eye copies only into those
+    if (g_stereo && g_eye == 0 && tex_eye_dep(st_)) mark_eye_dep(dt);
+    if (g_eye == 1 && !tex_eye_dep(dt)) return;
+    snap_reason = "tex2tex"; snapshots_invalidate(NULL);
     vk_end_pass();
     if (dl_on == 2) renderer_flush();  // (LARECOMP_VK_DEVLOST_TRACE=2: each copy its own submission, waited on)
     gp_mark(vk_cmd(), "copy texture %ux%u -> %ux%u", st_->width, st_->height, dt->width, dt->height);
@@ -6909,11 +6987,29 @@ void renderer_save_texture_raw(TexBackend *b, const char *path) { save_texture(b
 static void renderer_save_texture_alpha(TexBackend *b, const char *path) { save_texture(b, path, false, true); }
 
 // ================================================================== executor (exec_list)
+// VR stereo's right eye (backend_execute): what it leaves out - what writes guest memory, counts or signals (it was
+// done by the left eye's run), and clears of targets that aren't eye-dependent (they'd wipe what the left eye drew)
+static bool eye1_skips(const CmdRec *r) {
+    switch (r->op) {
+    case CMD_DISPATCH: case CMD_XFB_BEGIN: case CMD_XFB_END: case CMD_FENCE_SYNC: case CMD_REPORT_COUNTER:
+    case CMD_RESET_COUNTER: case CMD_COPY_BUFFER_TO_TEXTURE: case CMD_COPY_TEXTURE_TO_BUFFER: case CMD_COPY_BUFFER_TO_BUFFER:
+        return true;
+    case CMD_CLEAR_COLOR: {
+        int i = (int)r->x[0];
+        return !(i < st.rt.ncolor && tex_eye_dep(st.rt.color[i]));
+    }
+    case CMD_CLEAR_DEPTH_STENCIL: return !tex_eye_dep(st.rt.depth);
+    case CMD_CLEAR_TEXTURE: return !tex_eye_dep((const NvnTexture *)(uintptr_t)*(const uint64_t *)r->extra);
+    default: return false;  // (state, uniform updates - the same values again - draws and copies: decided there)
+    }
+}
+
 static void exec_list(uint64_t handle, int depth) {
     uint64_t p = handle;
     for (int guard = 0; guard < 10000000; guard++) {
         CmdRec *r = (CmdRec *)(uintptr_t)p;
         void *x = r->extra;
+        if (g_eye == 1 && eye1_skips(r)) { p += r->size; continue; }  // (VR stereo's right eye: see vk_set_stereo)
         if (r->op < CMD_COUNT) op_counts[r->op]++;
         switch (r->op) {
         case CMD_END: return;
@@ -7193,7 +7289,26 @@ static void exec_list(uint64_t handle, int depth) {
 void backend_execute(uint64_t handle) {
     gmem_grow();  // (macOS: the heap window grown before this list records anything)
     PROF_T0();
+    // VR stereo (vk_set_stereo): the list for the left eye, then again from the same state for the right, then on
+    // from where the left eye's left it (the next list carries on from that)
+    bool stereo = g_stereo;
+    __typeof__(st) begin;
+    if (stereo) begin = st;
+    g_eye = 0;
     exec_list(handle, 0);
+    if (stereo) {
+        vk_end_pass();
+        __typeof__(st) end = st;
+        bool xfb_end = xfb_active, oq_end = oq_counting;
+        st = begin, st.rt_dirty = true, xfb_active = false, oq_counting = false;
+        snap_reason = "eye"; snapshots_invalidate(NULL); ss_forget();
+        g_eye = 1;
+        exec_list(handle, 0);
+        vk_end_pass();
+        g_eye = 0;
+        st = end, st.rt_dirty = true, xfb_active = xfb_end, oq_counting = oq_end;
+        snapshots_invalidate(NULL); ss_forget();
+    }
     PROF_ADD(prof_exec);
     if (prof) cum_exec += SDL_GetTicksNS() - prof_t0_;
     static int sync_submit = -1;
