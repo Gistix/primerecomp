@@ -7,6 +7,7 @@
 #include <SDL3/SDL.h>
 #include <ctype.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,6 +44,21 @@ static uint8_t test_keys[BIND_KEY_HOST_COUNT];
 static _Atomic uint32_t test_pad;
 static _Atomic int32_t test_lx, test_ly, test_rx, test_ry;  // (a resting stick's drift: "lstick" / "rstick" in LARECOMP_HOST_INPUT)
 static bool host_test;  // (then a real controller is left out: the player's own pad must not spoil the test)
+
+// VR (runtime/nvn/vulkan/xr.c xr_frame_begin): the headset's own controllers - Quest Touch - as a second gamepad, its
+// buttons in SDL's gamepad bits (by position, as an Xbox controller's: A bottom right, B, X, Y; grips the shoulders,
+// triggers PADB_*TRIGGER, the left one's menu button Start) and its sticks (-1..1, y up); merged with the real pad's
+// in recompute_pad. Written by the render thread, read here: recompute_pad runs under pad_lock from either thread.
+static _Atomic uint32_t xr_host;
+static _Atomic float xr_stick[4];
+static _Atomic bool xr_active, xr_dirty;
+static pthread_mutex_t pad_lock = PTHREAD_MUTEX_INITIALIZER;
+void input_xr_pad(uint32_t host, const float sticks[4], bool active) {
+    bool changed = host != xr_host || active != xr_active;
+    for (int i = 0; i < 4; i++) changed |= sticks[i] != xr_stick[i], xr_stick[i] = sticks[i];
+    xr_host = host, xr_active = active;
+    if (changed) xr_dirty = true;  // (input_frame recomputes)
+}
 
 static int held_key(int sc) { return sc > 0 && sc < BIND_KEY_HOST_COUNT && (keys_down[sc] || test_keys[sc]); }
 
@@ -323,8 +339,17 @@ static uint8_t pad_menu[4];  // SDL_GAMEPAD_BUTTON_SOUTH, EAST, WEST, NORTH: pre
 static uint32_t pad_was;
 
 // Controller buttons (and the triggers as buttons) -> Switch buttons through g_bind_pad; the sticks stay the sticks.
+static void recompute_pad_(void);
+static void xr_sticks(void);
 static void recompute_pad(void) {
+    pthread_mutex_lock(&pad_lock);
+    recompute_pad_();
+    xr_sticks();
+    pthread_mutex_unlock(&pad_lock);
+}
+static void recompute_pad_(void) {
     uint32_t host = test_pad;
+    if (xr_active && !host_test) host |= xr_host;  // (VR's controllers: input_xr_pad)
     if (pad && !host_test) {
         for (int i = 0; i < SDL_GAMEPAD_BUTTON_COUNT; i++)
             if (SDL_GetGamepadButton(pad, (SDL_GamepadButton)i)) host |= 1u << i;
@@ -364,6 +389,24 @@ static void recompute_pad(void) {
     straight_snap(&pad_lx, &pad_ly);
     raw_rx = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTX), raw_ry = -SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTY);
     dead_zone(&pad_rx, &pad_ry, raw_rx, raw_ry, g_settings.deadzone[1]);
+}
+
+// VR's controllers' sticks (input_xr_pad): each stick the one pushed further, theirs or the real pad's
+static void xr_sticks(void) {
+    if (!xr_active || host_test) return;
+    int lx = (int)lroundf(xr_stick[0] * 32767), ly = (int)lroundf(xr_stick[1] * 32767);
+    int rx = (int)lroundf(xr_stick[2] * 32767), ry = (int)lroundf(xr_stick[3] * 32767);
+    _Atomic int32_t x = 0, y = 0;  // (dead_zone's and straight_snap's kind)
+    if ((int64_t)lx * lx + (int64_t)ly * ly > (int64_t)pad_lx * pad_lx + (int64_t)pad_ly * pad_ly) {
+        dead_zone(&x, &y, lx, ly, g_settings.deadzone[0]);
+        straight_snap(&x, &y);
+        if ((int64_t)x * x + (int64_t)y * y > (int64_t)pad_lx * pad_lx + (int64_t)pad_ly * pad_ly) pad_lx = x, pad_ly = y;
+    }
+    if ((int64_t)rx * rx + (int64_t)ry * ry > (int64_t)raw_rx * raw_rx + (int64_t)raw_ry * raw_ry) {
+        raw_rx = rx, raw_ry = ry;
+        dead_zone(&x, &y, rx, ry, g_settings.deadzone[1]);
+        pad_rx = x, pad_ry = y;
+    }
 }
 
 // Forget held keys (the menu took focus); the gamepad is re-read on its next event.
@@ -837,6 +880,7 @@ static void host_test_frame(uint64_t frame) {
 static uint64_t g_pad_obj;
 RT_ON_RESET(input_reboot_reset) { g_pad_obj = 0; }  // (reboot: the controller object was guest memory)
 void input_frame(uint64_t frame) {
+    if (xr_dirty) xr_dirty = false, recompute_pad();  // (VR's controllers changed: input_xr_pad)
     wiimote_start();  // (once: the Wii Remote's reader thread, runtime/hle/wiimote.c)
     // (once: the real controller's gyro read directly, for Steam Input's virtual pad - not in scripted runs, as SDL's
     // sensor events)

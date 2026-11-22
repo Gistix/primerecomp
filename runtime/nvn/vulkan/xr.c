@@ -47,6 +47,7 @@ void xr_capture_eyes(VkCommandBuffer cb, VkImage l, VkImage r, VkFormat fmt, uin
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
+#include "../../input_bind.h"
 #include "../../rt.h"
 #include "../../settings.h"
 
@@ -115,6 +116,16 @@ XR_FN(xrEndFrame);
 XR_FN(xrLocateSpace);
 XR_FN(xrLocateViews);
 XR_FN(xrEnumerateViewConfigurationViews);
+XR_FN(xrStringToPath);
+XR_FN(xrCreateActionSet);
+XR_FN(xrCreateAction);
+XR_FN(xrSuggestInteractionProfileBindings);
+XR_FN(xrAttachSessionActionSets);
+XR_FN(xrSyncActions);
+XR_FN(xrGetActionStateBoolean);
+XR_FN(xrGetActionStateFloat);
+XR_FN(xrGetActionStateVector2f);
+XR_FN(xrCreateActionSpace);
 XR_FN(xrGetVulkanGraphicsRequirements2KHR);
 XR_FN(xrCreateVulkanInstanceKHR);
 XR_FN(xrGetVulkanGraphicsDevice2KHR);
@@ -196,6 +207,11 @@ bool xr_setup(void) {
               LOAD(X.inst, xrWaitSwapchainImage) && LOAD(X.inst, xrReleaseSwapchainImage) && LOAD(X.inst, xrWaitFrame) &&
               LOAD(X.inst, xrBeginFrame) && LOAD(X.inst, xrEndFrame) && LOAD(X.inst, xrLocateSpace) &&
               LOAD(X.inst, xrLocateViews) && LOAD(X.inst, xrEnumerateViewConfigurationViews) &&
+              LOAD(X.inst, xrStringToPath) && LOAD(X.inst, xrCreateActionSet) && LOAD(X.inst, xrCreateAction) &&
+              LOAD(X.inst, xrSuggestInteractionProfileBindings) && LOAD(X.inst, xrAttachSessionActionSets) &&
+              LOAD(X.inst, xrSyncActions) && LOAD(X.inst, xrGetActionStateBoolean) &&
+              LOAD(X.inst, xrGetActionStateFloat) && LOAD(X.inst, xrGetActionStateVector2f) &&
+              LOAD(X.inst, xrCreateActionSpace) &&
               LOAD(X.inst, xrGetVulkanGraphicsRequirements2KHR) && LOAD(X.inst, xrCreateVulkanInstanceKHR) &&
               LOAD(X.inst, xrGetVulkanGraphicsDevice2KHR) && LOAD(X.inst, xrCreateVulkanDeviceKHR);
     if (!ok) { X.on = true; xr_off("the runtime lacks core functions"); return false; }
@@ -264,6 +280,7 @@ VkResult xr_create_vk_device(VkPhysicalDevice phys, const VkDeviceCreateInfo *di
     return VK_SUCCESS;
 }
 
+static void setup_actions(void);
 void xr_start_session(VkInstance inst, VkPhysicalDevice phys, VkDevice dev, uint32_t qfam) {
     if (!X.on) return;
     XrGraphicsBindingVulkan2KHR gb = {.type = XR_TYPE_GRAPHICS_BINDING_VULKAN2_KHR, .instance = inst,
@@ -283,6 +300,7 @@ void xr_start_session(VkInstance inst, VkPhysicalDevice phys, VkDevice dev, uint
     p_xrEnumerateEnvironmentBlendModes(X.inst, X.sys, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 8, &n, bm);
     X.blend = n ? bm[0] : XR_ENVIRONMENT_BLEND_MODE_OPAQUE;  // (the runtime's preferred one first)
     if (!hmx) hmx = SDL_CreateMutex();  // (head tracking: before any game thread asks for a pose)
+    setup_actions();
     {   // the runtime's recommended size of an eye's image (xr_eye_height: the game's render size in VR)
         XrViewConfigurationView vv[2] = {{.type = XR_TYPE_VIEW_CONFIGURATION_VIEW}, {.type = XR_TYPE_VIEW_CONFIGURATION_VIEW}};
         uint32_t nv = 0;
@@ -293,6 +311,135 @@ void xr_start_session(VkInstance inst, VkPhysicalDevice phys, VkDevice dev, uint
         }
     }
     LOG("[xr] session made; waiting for the headset\n");
+}
+
+// ---- controllers (Quest Touch): OpenXR actions, read each frame (xr_frame_begin) into runtime/hle/input.c as a
+// second gamepad - by position, as an Xbox controller: A (right, lower) = south, B east, X (left, lower) west, Y
+// north; the grips the shoulder buttons, the triggers the triggers, the sticks and their clicks, the left menu button
+// Start. The aim poses for the hands (aiming the arm cannon: to come).
+static struct {
+    XrActionSet set;
+    XrAction stick, trig, grip, click, a, b, x, y, menu, aim;
+    XrPath hand[2];
+    XrSpace aim_space[2];
+    bool ok;
+} A;
+
+static XrAction make_action(const char *name, const char *label, XrActionType type, bool hands) {
+    XrActionCreateInfo ci = {.type = XR_TYPE_ACTION_CREATE_INFO, .actionType = type,
+                             .countSubactionPaths = hands ? 2 : 0, .subactionPaths = hands ? A.hand : NULL};
+    snprintf(ci.actionName, sizeof ci.actionName, "%s", name);
+    snprintf(ci.localizedActionName, sizeof ci.localizedActionName, "%s", label);
+    XrAction a = XR_NULL_HANDLE;
+    XrResult r = p_xrCreateAction(A.set, &ci, &a);
+    if (XR_FAILED(r)) LOG("[xr] action %s: %s\n", name, res(r));
+    return a;
+}
+
+static void setup_actions(void) {
+    XrActionSetCreateInfo si = {.type = XR_TYPE_ACTION_SET_CREATE_INFO};
+    snprintf(si.actionSetName, sizeof si.actionSetName, "gameplay");
+    snprintf(si.localizedActionSetName, sizeof si.localizedActionSetName, "Gameplay");
+    if (XR_FAILED(p_xrCreateActionSet(X.inst, &si, &A.set))) { LOG("[xr] no action set: no controllers\n"); return; }
+    p_xrStringToPath(X.inst, "/user/hand/left", &A.hand[0]);
+    p_xrStringToPath(X.inst, "/user/hand/right", &A.hand[1]);
+    A.stick = make_action("stick", "Stick", XR_ACTION_TYPE_VECTOR2F_INPUT, true);
+    A.trig = make_action("trigger", "Trigger", XR_ACTION_TYPE_FLOAT_INPUT, true);
+    A.grip = make_action("grip", "Grip", XR_ACTION_TYPE_FLOAT_INPUT, true);
+    A.click = make_action("stick_click", "Stick click", XR_ACTION_TYPE_BOOLEAN_INPUT, true);
+    A.a = make_action("a", "A", XR_ACTION_TYPE_BOOLEAN_INPUT, false);
+    A.b = make_action("b", "B", XR_ACTION_TYPE_BOOLEAN_INPUT, false);
+    A.x = make_action("x", "X", XR_ACTION_TYPE_BOOLEAN_INPUT, false);
+    A.y = make_action("y", "Y", XR_ACTION_TYPE_BOOLEAN_INPUT, false);
+    A.menu = make_action("menu", "Menu", XR_ACTION_TYPE_BOOLEAN_INPUT, false);
+    A.aim = make_action("aim", "Aim", XR_ACTION_TYPE_POSE_INPUT, true);
+    struct { XrAction a; const char *path; } b[] = {
+        {A.stick, "/user/hand/left/input/thumbstick"}, {A.stick, "/user/hand/right/input/thumbstick"},
+        {A.trig, "/user/hand/left/input/trigger/value"}, {A.trig, "/user/hand/right/input/trigger/value"},
+        {A.grip, "/user/hand/left/input/squeeze/value"}, {A.grip, "/user/hand/right/input/squeeze/value"},
+        {A.click, "/user/hand/left/input/thumbstick/click"}, {A.click, "/user/hand/right/input/thumbstick/click"},
+        {A.a, "/user/hand/right/input/a/click"}, {A.b, "/user/hand/right/input/b/click"},
+        {A.x, "/user/hand/left/input/x/click"}, {A.y, "/user/hand/left/input/y/click"},
+        {A.menu, "/user/hand/left/input/menu/click"},
+        {A.aim, "/user/hand/left/input/aim/pose"}, {A.aim, "/user/hand/right/input/aim/pose"}};
+    enum { NB = sizeof b / sizeof *b };
+    XrActionSuggestedBinding sb[NB];
+    for (int i = 0; i < NB; i++) {
+        sb[i].action = b[i].a;
+        p_xrStringToPath(X.inst, b[i].path, &sb[i].binding);
+    }
+    XrPath touch;
+    p_xrStringToPath(X.inst, "/interaction_profiles/oculus/touch_controller", &touch);
+    XrInteractionProfileSuggestedBinding pb = {.type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING,
+                                               .interactionProfile = touch, .countSuggestedBindings = NB,
+                                               .suggestedBindings = sb};
+    XrResult r = p_xrSuggestInteractionProfileBindings(X.inst, &pb);
+    if (XR_FAILED(r)) { LOG("[xr] Touch controller bindings: %s\n", res(r)); return; }
+    XrSessionActionSetsAttachInfo at = {.type = XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO, .countActionSets = 1,
+                                        .actionSets = &A.set};
+    r = p_xrAttachSessionActionSets(X.session, &at);
+    if (XR_FAILED(r)) { LOG("[xr] attaching the controllers' actions: %s\n", res(r)); return; }
+    for (int h = 0; h < 2; h++) {
+        XrActionSpaceCreateInfo ci = {.type = XR_TYPE_ACTION_SPACE_CREATE_INFO, .action = A.aim, .subactionPath = A.hand[h],
+                                      .poseInActionSpace = {.orientation = {0, 0, 0, 1}}};
+        p_xrCreateActionSpace(X.session, &ci, &A.aim_space[h]);
+    }
+    A.ok = true;
+    LOG("[xr] controllers: Touch bindings suggested\n");
+}
+
+static bool act_bool(XrAction a, XrPath sub, bool *active) {
+    XrActionStateGetInfo gi = {.type = XR_TYPE_ACTION_STATE_GET_INFO, .action = a, .subactionPath = sub};
+    XrActionStateBoolean s = {.type = XR_TYPE_ACTION_STATE_BOOLEAN};
+    if (XR_FAILED(p_xrGetActionStateBoolean(X.session, &gi, &s))) return false;
+    *active |= s.isActive;
+    return s.isActive && s.currentState;
+}
+static float act_float(XrAction a, XrPath sub, bool *active) {
+    XrActionStateGetInfo gi = {.type = XR_TYPE_ACTION_STATE_GET_INFO, .action = a, .subactionPath = sub};
+    XrActionStateFloat s = {.type = XR_TYPE_ACTION_STATE_FLOAT};
+    if (XR_FAILED(p_xrGetActionStateFloat(X.session, &gi, &s))) return 0;
+    *active |= s.isActive;
+    return s.isActive ? s.currentState : 0;
+}
+static XrVector2f act_vec2(XrAction a, XrPath sub, bool *active) {
+    XrActionStateGetInfo gi = {.type = XR_TYPE_ACTION_STATE_GET_INFO, .action = a, .subactionPath = sub};
+    XrActionStateVector2f s = {.type = XR_TYPE_ACTION_STATE_VECTOR2F};
+    if (XR_FAILED(p_xrGetActionStateVector2f(X.session, &gi, &s)) || !s.isActive) return (XrVector2f){0, 0};
+    *active = true;
+    return s.currentState;
+}
+
+// Each frame: the controllers' state to the game's input (runtime/hle/input.c input_xr_pad); nothing while the
+// session isn't focused (the runtime's own menu is up, the headset is off)
+static void read_controllers(void) {
+    extern void input_xr_pad(uint32_t host, const float sticks[4], bool active);
+    static bool was;
+    if (!A.ok || X.state != XR_SESSION_STATE_FOCUSED) {
+        if (was) input_xr_pad(0, (const float[4]){0}, false), was = false;
+        return;
+    }
+    XrActiveActionSet as = {.actionSet = A.set, .subactionPath = XR_NULL_PATH};
+    XrActionsSyncInfo si = {.type = XR_TYPE_ACTIONS_SYNC_INFO, .countActiveActionSets = 1, .activeActionSets = &as};
+    if (XR_FAILED(p_xrSyncActions(X.session, &si))) return;
+    bool active = false;
+    XrVector2f l = act_vec2(A.stick, A.hand[0], &active), r = act_vec2(A.stick, A.hand[1], &active);
+    uint32_t host = 0;
+    if (act_bool(A.a, XR_NULL_PATH, &active)) host |= 1u << SDL_GAMEPAD_BUTTON_SOUTH;
+    if (act_bool(A.b, XR_NULL_PATH, &active)) host |= 1u << SDL_GAMEPAD_BUTTON_EAST;
+    if (act_bool(A.x, XR_NULL_PATH, &active)) host |= 1u << SDL_GAMEPAD_BUTTON_WEST;
+    if (act_bool(A.y, XR_NULL_PATH, &active)) host |= 1u << SDL_GAMEPAD_BUTTON_NORTH;
+    if (act_bool(A.click, A.hand[0], &active)) host |= 1u << SDL_GAMEPAD_BUTTON_LEFT_STICK;
+    if (act_bool(A.click, A.hand[1], &active)) host |= 1u << SDL_GAMEPAD_BUTTON_RIGHT_STICK;
+    if (act_bool(A.menu, XR_NULL_PATH, &active)) host |= 1u << SDL_GAMEPAD_BUTTON_START;
+    if (act_float(A.grip, A.hand[0], &active) > 0.5f) host |= 1u << SDL_GAMEPAD_BUTTON_LEFT_SHOULDER;
+    if (act_float(A.grip, A.hand[1], &active) > 0.5f) host |= 1u << SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER;
+    if (act_float(A.trig, A.hand[0], &active) > 0.5f) host |= 1u << PADB_LTRIGGER;
+    if (act_float(A.trig, A.hand[1], &active) > 0.5f) host |= 1u << PADB_RTRIGGER;
+    float st[4] = {l.x, l.y, r.x, r.y};
+    if (active != was) LOG("[xr] controllers %s\n", active ? "in use: they're a gamepad" : "gone");
+    was = active;
+    input_xr_pad(host, st, active);
 }
 
 static void poll_events(void) {
@@ -357,6 +504,7 @@ void xr_frame_begin(void) {
                                                      : "the headset takes every frame again");
         X.throttled = thr;
     }
+    read_controllers();
     {   // the eyes' field of view (the game's, while VR is on: runtime/hle/game.c rt_fov)
         XrViewLocateInfo li = {.type = XR_TYPE_VIEW_LOCATE_INFO, .viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
                                .displayTime = X.display_time, .space = X.space};
