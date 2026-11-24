@@ -445,16 +445,35 @@ static void read_controllers(void) {
     XrVector2f l = act_vec2(A.stick, A.hand[0], &active), r = act_vec2(A.stick, A.hand[1], &active);
     uint32_t host = 0;
     if (act_bool(A.a, XR_NULL_PATH, &active)) host |= 1u << SDL_GAMEPAD_BUTTON_SOUTH;
-    if (act_bool(A.b, XR_NULL_PATH, &active)) host |= 1u << SDL_GAMEPAD_BUTTON_EAST;
+    // (B in play: the pause menu - an Xbox pad's Back, the Switch's Minus. As the Switch's A, by position, it only
+    // fired the beam again, as the right trigger does; nothing else reaches the pause menu - the left menu button is
+    // the map. In menus it's B, back. It keeps the meaning it was pressed with until it's let go: the pause menu it
+    // opens isn't also backed out of.)
+    extern bool game_in_play(void);
+    static int b_as = -1;
+    if (act_bool(A.b, XR_NULL_PATH, &active)) {
+        if (b_as < 0) b_as = game_in_play() ? SDL_GAMEPAD_BUTTON_BACK : SDL_GAMEPAD_BUTTON_EAST;
+        host |= 1u << b_as;
+    } else b_as = -1;
     if (act_bool(A.x, XR_NULL_PATH, &active)) host |= 1u << SDL_GAMEPAD_BUTTON_WEST;
     if (act_bool(A.y, XR_NULL_PATH, &active)) host |= 1u << SDL_GAMEPAD_BUTTON_NORTH;
-    if (act_bool(A.click, A.hand[0], &active)) host |= 1u << SDL_GAMEPAD_BUTTON_LEFT_STICK;
+    bool lclick = act_bool(A.click, A.hand[0], &active);
     if (act_bool(A.click, A.hand[1], &active)) host |= 1u << SDL_GAMEPAD_BUTTON_RIGHT_STICK;
     if (act_bool(A.menu, XR_NULL_PATH, &active)) host |= 1u << SDL_GAMEPAD_BUTTON_START;
-    if (act_float(A.grip, A.hand[0], &active) > 0.5f) host |= 1u << SDL_GAMEPAD_BUTTON_LEFT_SHOULDER;
+    act_float(A.grip, A.hand[0], &active);  // (the left grip: free - as the Switch's L it only jumped again, as A does)
     if (act_float(A.grip, A.hand[1], &active) > 0.5f) host |= 1u << SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER;
     if (act_float(A.trig, A.hand[0], &active) > 0.5f) host |= 1u << PADB_LTRIGGER;
     if (act_float(A.trig, A.hand[1], &active) > 0.5f) host |= 1u << PADB_RTRIGGER;
+    // No d-pad on these controllers: the left stick's click held, the right stick is the d-pad - the visors (up
+    // Combat, right Scan, down Thermal, left X-Ray); left Y held (beam select: the game's X), the same picks a beam.
+    // The right stick doesn't turn meanwhile. (Its click alone is no longer the left stick's: that's Show a hint.)
+    if (lclick || (host & 1u << SDL_GAMEPAD_BUTTON_NORTH)) {
+        if (fabsf(r.x) > 0.6f || fabsf(r.y) > 0.6f) {
+            host |= 1u << (fabsf(r.x) > fabsf(r.y) ? (r.x > 0 ? SDL_GAMEPAD_BUTTON_DPAD_RIGHT : SDL_GAMEPAD_BUTTON_DPAD_LEFT)
+                                                    : (r.y > 0 ? SDL_GAMEPAD_BUTTON_DPAD_UP : SDL_GAMEPAD_BUTTON_DPAD_DOWN));
+        }
+        r.x = r.y = 0;
+    }
     float st[4] = {l.x, l.y, r.x, r.y};
     if (active != was) LOG("[xr] controllers %s\n", active ? "in use: they're a gamepad" : "gone");
     was = active;

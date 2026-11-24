@@ -1442,15 +1442,18 @@ static void vr_head_apply(Cpu *c, uint64_t cam, uint64_t sm) {
 // (its assisted aiming: tools/patches.py, rt_gun_in_hand). CPlayerGunMP1::Update draws the gun from that transform, in
 // the pointer aiming mode turned toward the aim point with the world's up - the hand's roll is put back after
 // (rt_gun_roll). Shots start from the gun and aim at the cursor's point in the world (CPlayerGunMP1::FirePrimary:
-// CTransform4f::LookAt it): a point far along the hand's pointing (CAimingCursorMP1::GetCursorInWorld / ...ForGun) -
-// locked on, the target, and the gun is turned to point at it (its roll kept), wherever the view looks.
+// CTransform4f::LookAt it): what the hand's pointing hits - the cursor's own ray (CAimingCursorMP1::Update) cast from
+// the gun along it (rt_cursor_ray), so the reticle, drawn on the line from the eye to that spot, sits where the shot
+// lands - locked on, the target, and the gun is turned to point at it (its roll kept), wherever the view looks.
 #define VR_HAND_SCALE 2.0f  // (game units per metre the hand moves: the Ryujinx VR mod's)
 #define VR_GUN_BACK 0.55f   // (the gun drawn back along where it points: the mod's)
 static bool g_hand_on;       // (the gun was put in the hand lately - the cursor follows it)
 static uint64_t g_hand_frame;
 static float g_hand_pos[3];   // (the gun's place in the hand, in the world)
 static float g_hand_up[3];    // (the hand's up, in the world: rt_gun_roll)
+static float g_hand_fwd[3];   // (where the hand points, in the world: rt_cursor_ray)
 static float *g_hand_cursor;  // (guest-visible: the cursor's point the game reads)
+static uint64_t g_hand_ray_frame;  // (the cursor's ray was the hand's lately: its point is what the hand hits)
 
 // The point the game locks onto (+0x4f0: what CPlayerMP1::GetHUDOrbitTargetPosition shows) while locked on (the
 // orbit state, +0x4e0), and the way to it from the gun in the hand. (Never the origin: +0x5e4, tried first, read that.)
@@ -1494,7 +1497,7 @@ static bool vr_hand_gun(Cpu *c, const float gun[12], float out[12]) {
         for (int j = 0; j < 3; j++) out[i * 4 + j] = D[i * 3] * gun[j] + D[i * 3 + 1] * gun[4 + j] + D[i * 3 + 2] * gun[8 + j];
     // where it points (the camera's view axis, turned with the hand) and Samus' eye
     float fwd[3];
-    for (int i = 0; i < 3; i++) fwd[i] = -sg * W[i * 3 + 2], g_hand_up[i] = W[i * 3 + 1];
+    for (int i = 0; i < 3; i++) fwd[i] = -sg * W[i * 3 + 2], g_hand_up[i] = W[i * 3 + 1], g_hand_fwd[i] = fwd[i];
     Cpu *saved = malloc(sizeof *saved);
     *saved = *c;
     c->x[0] = player;
@@ -1569,13 +1572,41 @@ int rt_gun_in_hand(void) {
     return vr_hand_live();
 }
 
-// Where the gun in the hand aims (the world): far along the hand's pointing, or locked on, the target (vr_lock_target)
-// - wherever the view looks. False: the game's own.
+// From CAimingCursorMP1::Update (tools/patches.py), before it casts its ray into the world (BuildNearList,
+// NCollisionMP1::RayWorldIntersectionFixed: 100 units, the player left out): with the gun in the hand the player's
+// cursor (x19, the player's +0x1160) casts from the gun along the hand's pointing, not from the camera through the
+// view - its point in the world (+0x94) is then what the hand points at, and its object (+0xb0, which aim assist and
+// missiles' homing read) too. The ray's origin is the camera's transform's translation on the stack ([x29 - 0x94],
+// - 0x84, - 0x74), its direction [x29 - 0xb0].
+void rt_cursor_ray(Cpu *c) {
+    extern uint64_t vk_frame_counter(void);
+    if (!vr_hand_live() || c->x[19] != g_player + 0x1160) return;
+    static const int org[3] = {0x94, 0x84, 0x74};
+    for (int i = 0; i < 3; i++) {
+        float o = g_hand_pos[i], d = g_hand_fwd[i];
+        uint32_t ob, db;
+        memcpy(&ob, &o, 4), memcpy(&db, &d, 4);
+        ST32(c->x[29] - org[i], ob);
+        ST32(c->x[29] - 0xb0 + 4 * i, db);
+    }
+    g_hand_ray_frame = vk_frame_counter();
+}
+
+// Where the gun in the hand aims (the world): what the hand points at (the cursor's point, its ray the hand's:
+// rt_cursor_ray; till then far along the pointing), or locked on, the target (vr_lock_target) - wherever the view
+// looks. False: the game's own.
 static bool vr_aim(float at[3]) {
+    extern uint64_t vk_frame_counter(void);
     float to[3];
     if (!vr_hand_live()) return false;
     if (vr_lock_target(at, to)) return true;
     if (LD32(g_player + 0x4e0) != 0) return false;  // (locked on, no target point: the game's)
+    const float *hit = (const float *)(uintptr_t)(g_player + 0x1160 + 0x94);
+    if (g_hand_ray_frame && vk_frame_counter() <= g_hand_ray_frame + 2 && isfinite(hit[0]) && isfinite(hit[1]) &&
+        isfinite(hit[2])) {
+        memcpy(at, hit, 12);
+        return true;
+    }
     memcpy(at, g_hand_cursor, 12);
     return true;
 }

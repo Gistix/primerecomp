@@ -46,8 +46,9 @@ static _Atomic int32_t test_lx, test_ly, test_rx, test_ry;  // (a resting stick'
 static bool host_test;  // (then a real controller is left out: the player's own pad must not spoil the test)
 
 // VR (runtime/nvn/vulkan/xr.c xr_frame_begin): the headset's own controllers - Quest Touch - as a second gamepad, its
-// buttons in SDL's gamepad bits (by position, as an Xbox controller's: A bottom right, B, X, Y; grips the shoulders,
-// triggers PADB_*TRIGGER, the left one's menu button Start) and its sticks (-1..1, y up); merged with the real pad's
+// buttons in SDL's gamepad bits (by position, as an Xbox controller's: A bottom right, X, Y; B Back - the pause menu;
+// the right grip the right shoulder, the left one free; triggers PADB_*TRIGGER, the left one's menu button Start; the d-pad the right stick with the left stick's click or
+// Y held) and its sticks (-1..1, y up); merged with the real pad's
 // in recompute_pad. Written by the render thread, read here: recompute_pad runs under pad_lock from either thread.
 static _Atomic uint32_t xr_host;
 static _Atomic float xr_stick[4];

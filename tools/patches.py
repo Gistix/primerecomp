@@ -106,3 +106,19 @@ PATCHES[0x7000cb6d00] = lambda gen, a: ('{ extern uint64_t rt_cursor_plane(uint6
 # it about where it points by the hand's roll (runtime/hle/game.c rt_gun_roll).
 PATCHES[0x7000c942e0] = lambda gen, a: ('{ extern void rt_gun_roll(Cpu *); rt_gun_roll(c); '
                                         'c->x[8] = LD64(c->x[19] + 0x520); }')
+# ... and CPlayerGunMP1::FirePrimary, which with an aim target picked (the player's +0x5e0) and not locked on fires the
+# beam along the gun's assisted-aiming transforms (gun + 0x184 / + 0x1b4: UpdateAssistedAiming's, skipped above, so
+# stale) instead of at GetCursorInWorld: its `mov w22, #1` (that case) is 0 while the gun is in the hand, so the shot
+# goes where the hand points. Locked on (its `and w22, w8, w9`) it fires at the player's +0x5e4, the target's place
+# as UpdateAimTargetPrediction (skipped) predicts it - 0,0,0 then: 0 too, so the cursor's point, which locked on is the
+# target (runtime/hle/game.c vr_aim). (FireSecondary's missiles always aim at the cursor - the aim target only homes
+# them.)
+PATCHES[0x7000c997a0] = lambda gen, a: '{ extern int rt_gun_in_hand(void); c->x[22] = rt_gun_in_hand() ? 0 : 1; }'
+PATCHES[0x7000c99788] = lambda gen, a: ('{ extern int rt_gun_in_hand(void); '
+                                        'c->x[22] = rt_gun_in_hand() ? 0 : (uint32_t)(c->x[8] & c->x[9]); }')
+# ... and CAimingCursorMP1::Update, at its `stur w8, [x29, #-0xb8]` (the hit's id cleared), after it made its ray
+# (from the camera through the cursor, normalized) and before it casts it (BuildNearList, RayWorldIntersectionFixed):
+# with the gun in the hand the ray is the gun's, along the hand's pointing (runtime/hle/game.c rt_cursor_ray), so the
+# cursor's point in the world - which shots aim at and the reticle shows - is what the hand points at.
+PATCHES[0x7000cb6788] = lambda gen, a: ('{ ST32(c->x[29] - 0xb8, (uint32_t)c->x[8]); '
+                                        'extern void rt_cursor_ray(Cpu *); rt_cursor_ray(c); }')
