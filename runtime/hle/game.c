@@ -1366,7 +1366,8 @@ static void rt_fp_think(Cpu *c) {
 
 // ---- VR head tracking (runtime/nvn/vulkan/xr.c): the head turns and moves the first-person camera, not the aim.
 // After the camera's update (CFirstPersonCameraMP1::Think, which makes it from Samus' facing and her look up and down
-// every frame) its transform is turned by the head's rotation in its own axes and moved by the head's movement (about
+// every frame) its transform is made the head's rotation from the camera's facing about up (the game's look up and
+// down left out of the view) and moved by the head's movement (about
 // the world's up - y - only: looking down and stepping forward goes forward, not into the floor), through
 // CActorMP1::SetTransform - so
 // the world is drawn, and culled, from where the player looks. At the next frame's start (CStateManager::BeginFrame:
@@ -1410,9 +1411,19 @@ static void vr_head_apply(Cpu *c, uint64_t cam, uint64_t sm) {
     if (!m) return;
     memcpy(g_vr_saved, m, 48);
     g_vr_saved_ok = true;
-    float n[12];
-    for (int i = 0; i < 3; i++) {  // the rotation: the camera's axes (columns) turned by the head's, in the camera's
-        for (int j = 0; j < 3; j++) n[i * 4 + j] = m[i * 4] * h[j] + m[i * 4 + 1] * h[3 + j] + m[i * 4 + 2] * h[6 + j];
+    // the rotation: the head's, from the camera's facing about the world's up only - its view axis (z) flattened, y
+    // up, x = y cross z. The game's look up and down (the right stick's, the player's +0x5cc) and any tilt it gives
+    // the camera are left out: the head looks up and down, and the head's turn taken about a tipped camera's axes
+    // rolled the horizon
+    float n[12], zx = m[2], zz = m[10], zl = sqrtf(zx * zx + zz * zz);
+    if (zl > 1e-4f) {
+        zx /= zl, zz /= zl;
+        float Y[9] = {zz, 0, zx, 0, 1, 0, -zx, 0, zz};  // (row-major; columns x = (zz, 0, -zx), y up, z = (zx, 0, zz))
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++) n[i * 4 + j] = Y[i * 3] * h[j] + Y[i * 3 + 1] * h[3 + j] + Y[i * 3 + 2] * h[6 + j];
+    } else {  // (looking straight up or down: the camera's own axes)
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++) n[i * 4 + j] = m[i * 4] * h[j] + m[i * 4 + 1] * h[3 + j] + m[i * 4 + 2] * h[6 + j];
     }
     // the movement (OpenXR's axes: x right, y up, z back) along the camera's facing about the world's up (y): ahead
     // is its view axis (z, either way: xr_cam_sign) flattened, right that turned a quarter
